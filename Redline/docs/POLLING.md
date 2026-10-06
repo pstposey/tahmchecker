@@ -40,18 +40,20 @@ Every request records `sentAt` (just before the write), `firstByteAt` (first not
 
 Run each for ~30 s while idling, and share the debug report after each.
 
-1. **Baseline:** preset *RPM only*, both experimental toggles off. This gives the max single-PID rate and the RTT distribution.
+1. **Baseline:** preset *RPM only*, physical addressing off. This gives the max single-PID rate and the RTT distribution.
 2. **RPM + Boost:** shows how rate is shared across 4 PIDs.
 3. **Physical addressing** (`ATSH7E0`) on → reconnect. Hypothesis (UNVERIFIED): only the ECM answers, so the adapter doesn't wait for other ECUs.
-4. **Response-count hint** (`010C1`) on → reconnect. Per the ELM327 documentation (v1.3+, as summarized by secondary sources) the adapter returns right after the expected number of replies instead of waiting out its timeout. This could be the single biggest win. Clones may not support it; Redline turns it off automatically if the adapter answers `?`.
-5. Both on.
+
+The **response-count hint** (`010C` + `1`) is disabled by the read-only policy. A hinted request that lost its first character on a busy adapter would be a diagnostic-session or ECU-reset request (SAFETY.md §4). It can only come back as a reviewed exception, if ever.
+
+Run the experiments **per adapter**. The Vgate (BLE) and the OBDLink MX+ (MFi, Bluetooth Classic) have different link characteristics. Neither adapter's rate or latency is known yet; OBDLink's marketing figure (up to 100 samples/s on iOS) is not a measurement. The scheduler is the same adaptive one for both.
 
 Interpreting the results:
 
 - **High time-to-first-byte, small gap to completion** → ECU or adapter wait dominates (timeout, functional addressing). Experiments 3 and 4 target this.
-- **Small time-to-first-byte, large gap to completion** → BLE fragmentation or connection interval dominates.
+- **Small time-to-first-byte, large gap to completion** → link fragmentation or BLE connection interval dominates (on the MX+: how iOS delivers MFi stream data, UNVERIFIED).
 - Decode and publish times should be sub-millisecond. If they aren't, that's our bug.
 
-Later experiments, only if the data justifies them: `ATS0` (fewer bytes), multi-PID requests (`010C0B11`, up to 6 PIDs per request on CAN; whether this ECU supports it is UNVERIFIED), and tuning `ATST`/`ATAT`.
+Later experiments, only if the data justifies them: `ATS0` (fewer bytes) and tuning `ATST`/`ATAT`. Multi-PID requests (`010C0B11`) are refused by the truncation rule; they would also need a reviewed exception.
 
 Results go into DEVLOG.md. Redline shouldn't be described as faster than WrenchTime until these numbers exist.
