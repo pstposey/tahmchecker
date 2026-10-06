@@ -318,15 +318,16 @@ struct ReviewRegressionTests {
             default: return .silence
             }
         }
-        let s = try await makeSession(t)
-        let start = ContinuousClock().now
+        let s = try await makeSession(t) // timeout 300 ms, grace 150 ms, resync 300 ms
+        await #expect(throws: ELMSessionError.timedOut(command: "010C")) { try await s.execute("010C") }
+        // Event-driven (no wall-clock race): the first part of the late answer
+        // is already buffered when the next command starts its 150 ms grace
+        // wait; the rest (with the prompt) lands after the grace has expired.
+        t.send("41 0C 1A")
         Task {
-            try? await ContinuousClock().sleep(until: start + .milliseconds(400))
-            t.send("41 0C 1A")
-            try? await ContinuousClock().sleep(until: start + .milliseconds(475))
+            try? await Task.sleep(for: .milliseconds(250))
             t.send(" F8\r\r>")
         }
-        await #expect(throws: ELMSessionError.timedOut(command: "010C")) { try await s.execute("010C") }
         let ex = try await s.execute("010D")
         #expect(ex.response.lines == ["41 0D 32"])
         #expect(t.writtenCommands == ["010C", "010D"]) // no bare CR was needed
@@ -346,21 +347,38 @@ struct ReviewRegressionTests {
 @MainActor
 @Suite("Regression: engine lifecycle")
 struct EngineLifecycleRegressionTests {
+    /// Simulator whose first close() takes a while, so stop() is reliably
+    /// still mid-teardown when the test issues start(), while a newly started
+    /// connection can open meanwhile (later closes are immediate).
+    final class SlowCloseTransport: OBDTransport, @unchecked Sendable {
+        let inner = SimulatedELM327Transport()
+        private let closes = Locked(0)
+        var identity: TransportIdentity { inner.identity }
+        func open(log: CommLog) async throws -> AsyncStream<TransportEvent> { try await inner.open(log: log) }
+        func write(_ data: Data) async throws { try await inner.write(data) }
+        func close() async {
+            let first = closes.withLock { n -> Bool in n += 1; return n == 1 }
+            if first { try? await Task.sleep(for: .seconds(3)) }
+            await inner.close()
+        }
+        func linkDetails() async -> TransportLinkDetails { await inner.linkDetails() }
+    }
+
     @Test func startDuringStopDoesNotKillNewConnection() async throws {
         let engine = TelemetryEngine(pollingPreset: .rpmOnly)
         engine.autoReconnect = false // a killed connection must not be masked by reconnecting
-        engine.start(transport: SimulatedELM327Transport())
+        engine.start(transport: SlowCloseTransport())
         try await waitUntil(seconds: 15) { engine.state == .streaming }
         let stopping = Task { await engine.stop() }
-        await Task.yield()
+        try await waitUntil(seconds: 5) { engine.isStopping } // stop() is mid-teardown
         engine.start(transport: SimulatedELM327Transport())
         await stopping.value
-        #expect(engine.state != .idle) // stop() must not report idle over the new connection
+        #expect(!engine.isStopping)
         try await waitUntil(seconds: 15) { engine.state == .streaming }
         let rpm = engine.store.channel(.engineRPM)!
         let before = rpm.sampleCount
         try await Task.sleep(for: .seconds(1))
-        #expect(engine.state == .streaming) // not idle / reconnecting
+        #expect(engine.state == .streaming) // the new connection was not closed or reported idle
         #expect(rpm.sampleCount > before)
         await engine.stop()
         #expect(engine.state == .idle)
@@ -457,5 +475,35 @@ struct StoreAccuracyRegressionTests {
         for i in 0..<3 { store.apply([.sample(sample(.engineRPM, 750, at: t + .seconds(6) + .milliseconds(100 * i)))]) }
         let hz = store.channel(.engineRPM)!.observedRateHz!
         #expect(abs(hz - 10) < 0.01)
+    }
+}
+
+@Suite("Regression: fix verification")
+struct FixVerificationRegressionTests {
+    /// A link drop during the post-CR absorb wait must surface as a link
+    /// failure, not let the next command be written to a closed transport.
+    @Test func linkLossDuringResyncIsReportedNotSwallowed() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "": return .text("STOPPED\r\r>", after: .milliseconds(20))
+            default: return .silence
+            }
+        }
+        var timing = ELM327Session.Timing()
+        timing.defaultTimeout = .milliseconds(200)
+        timing.latePromptGrace = .milliseconds(300)
+        timing.resyncTimeout = .milliseconds(300)
+        let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
+        await s.start(consuming: try await t.open(log: s.log))
+        await #expect(throws: ELMSessionError.timedOut(command: "010D")) { try await s.execute("010D") }
+        let start = ContinuousClock().now
+        Task {
+            // grace (300) + CR reply (~20) puts us inside the absorb wait.
+            try? await ContinuousClock().sleep(until: start + .milliseconds(420))
+            t.disconnect()
+        }
+        await #expect(throws: ELMSessionError.self) { try await s.execute("010C") }
+        #expect(!t.writtenCommands.contains("010C")) // never written to the dead link
+        #expect(await s.isClosed)
     }
 }

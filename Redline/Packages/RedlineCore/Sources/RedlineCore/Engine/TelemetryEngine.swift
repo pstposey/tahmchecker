@@ -57,6 +57,8 @@ public final class TelemetryEngine {
     public private(set) var effectiveOptions: ELMOptions?
     public private(set) var polledChannels: Set<ChannelID> = []
     public private(set) var isPaused = false
+    /// True while `stop()` is tearing down the current source.
+    public private(set) var isStopping = false
 
     /// Requested options; applied at the next (re)connection.
     public var options: ELMOptions
@@ -114,6 +116,8 @@ public final class TelemetryEngine {
     /// issued while `stop()` is still waiting chains after it instead of
     /// racing it (and `stop()` never closes a transport started meanwhile).
     public func stop() async {
+        isStopping = true
+        defer { isStopping = false }
         let task = connectionTask
         task?.cancel()
         let session = self.session

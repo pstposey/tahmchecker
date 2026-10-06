@@ -137,6 +137,7 @@ public actor ELM327Session {
 
         if needsResync {
             try await resynchronize()
+            if isClosed { throw ELMSessionError.closed }
         }
         // The adapter is idle (last prompt seen), so anything buffered
         // without a prompt is noise.
@@ -301,7 +302,7 @@ public actor ELM327Session {
 
     private func resynchronize() async throws {
         log.warning("Resynchronizing: waiting for late prompt")
-        if await waitForPrompt(timing.latePromptGrace) {
+        if try await waitForPrompt(timing.latePromptGrace) {
             needsResync = false
             return
         }
@@ -311,7 +312,7 @@ public actor ELM327Session {
         // ELM327 repeat the command and shifting every later response by one.
         if framer.hasPartialResponse {
             log.warning("Resynchronizing: late response in progress, waiting for it to finish")
-            if await waitForPrompt(timing.resyncTimeout) {
+            if try await waitForPrompt(timing.resyncTimeout) {
                 needsResync = false
                 return
             }
@@ -328,10 +329,10 @@ public actor ELM327Session {
         } catch {
             throw ELMSessionError.transport((error as? TransportError) ?? .writeFailed(String(describing: error)))
         }
-        if await waitForPrompt(timing.resyncTimeout) {
+        if try await waitForPrompt(timing.resyncTimeout) {
             // If the late prompt and the CR's own reply crossed, a second
             // prompt follows; absorb it so it can't complete the next command.
-            _ = await waitForPrompt(timing.latePromptGrace)
+            _ = try await waitForPrompt(timing.latePromptGrace)
             if Task.isCancelled { throw ELMSessionError.cancelled }
             needsResync = false
             return
@@ -341,13 +342,21 @@ public actor ELM327Session {
         throw ELMSessionError.adapterUnresponsive
     }
 
-    private func waitForPrompt(_ timeout: Duration) async -> Bool {
+    /// Waits for one prompt and discards its response. Returns false when
+    /// none arrives in time; throws if the link closes, so a disconnect during
+    /// resync is reported as such rather than as "no prompt".
+    private func waitForPrompt(_ timeout: Duration) async throws -> Bool {
+        if isClosed { throw ELMSessionError.closed }
         let id = beginPending()
         armTimeout(id, timeout, command: "<resync>")
         do {
             let c = try await awaitCompletion(id)
             log.info("Resync discarded: \(Self.oneLine(c.text))")
             return true
+        } catch let error as ELMSessionError {
+            if case .transport = error { throw error }
+            if isClosed { throw ELMSessionError.closed }
+            return false
         } catch {
             return false
         }

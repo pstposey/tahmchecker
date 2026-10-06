@@ -241,10 +241,13 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
         }
         let reply = await probeExchange(candidate, timeout: 1.5)
         if reply == nil {
+            // Best-effort cleanup first; it bails out immediately if the link
+            // already closed or open() was cancelled. The checks run after it
+            // so a loss *during* cleanup isn't reported as "no ELM reply".
+            try? await setNotify(false, candidate: candidate)
             try Task.checkCancellation()
             let stillConnected = await onQueue { self.mode != .closed && self.peripheral?.state == .connected }
             guard stillConnected else { throw TransportError.disconnected("link lost while probing") }
-            try? await setNotify(false, candidate: candidate)
         }
         return reply
     }

@@ -106,6 +106,7 @@ final class BLECentral: NSObject, @unchecked Sendable {
     private var connectWaiters: [UUID: (token: UUID, continuation: CheckedContinuation<Void, Error>)] = [:]
     /// Attempts cancelled before their queue block ran.
     private var cancelledConnectTokens: Set<UUID> = []
+    private var cancelledStateTokens: Set<UUID> = []
     /// Peripherals we asked CoreBluetooth to disconnect whose
     /// didDisconnectPeripheral has not arrived yet. That callback belongs to
     /// the old link and must not fail a new connection to the same adapter.
@@ -157,8 +158,26 @@ final class BLECentral: NSObject, @unchecked Sendable {
 
     func waitUntilPoweredOn(timeout: TimeInterval) async throws {
         let token = UUID()
+        try await withTaskCancellationHandler {
+            try await waitUntilPoweredOn(token: token, timeout: timeout)
+        } onCancel: {
+            self.queue.async {
+                if let waiter = self.stateWaiters.removeValue(forKey: token) {
+                    waiter.resume(throwing: CancellationError())
+                } else {
+                    self.cancelledStateTokens.insert(token) // not registered yet
+                }
+            }
+        }
+    }
+
+    private func waitUntilPoweredOn(token: UUID, timeout: TimeInterval) async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             queue.async {
+                if self.cancelledStateTokens.remove(token) != nil {
+                    c.resume(throwing: CancellationError())
+                    return
+                }
                 switch self.central?.state {
                 case .poweredOn?:
                     c.resume()
