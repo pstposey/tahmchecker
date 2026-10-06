@@ -277,3 +277,20 @@ func waitUntil(seconds: Double, _ condition: @MainActor () -> Bool) async throws
         try await Task.sleep(for: .milliseconds(20))
     }
 }
+
+@MainActor
+@Suite("Debug report")
+struct DebugReportTests {
+    @Test func reportContainsKeySections() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmAndBoost)
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { (engine.store.channel(.engineRPM)?.sampleCount ?? 0) > 5 }
+        let report = engine.debugReport(appVersion: "test")
+        #expect(report.contains("Source: SIMULATION"))
+        #expect(report.contains("ATZ banner: ELM327 v1.5"))
+        #expect(report.contains("7E8:"))
+        #expect(report.contains("RPM  target 10.0 Hz"))
+        #expect(report.contains("TX 010C"))
+        await engine.stop()
+    }
+}

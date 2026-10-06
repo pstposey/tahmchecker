@@ -26,10 +26,20 @@ public struct TransportIdentity: Sendable, Equatable {
 /// Link-level details discovered while opening the transport, shown in the
 /// debug console (e.g. which GATT characteristics were verified).
 public struct TransportLinkDetails: Sendable, Equatable {
-    public var summary: [String: String]
+    public struct Item: Sendable, Equatable, Identifiable {
+        public var id: String { key }
+        public let key: String
+        public let value: String
+        public init(_ key: String, _ value: String) {
+            self.key = key
+            self.value = value
+        }
+    }
 
-    public init(summary: [String: String] = [:]) {
-        self.summary = summary
+    public var items: [Item]
+
+    public init(items: [Item] = []) {
+        self.items = items
     }
 }
 

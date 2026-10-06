@@ -97,8 +97,12 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
     }
 
     public func linkDetails() async -> TransportLinkDetails {
-        TransportLinkDetails(summary: ["Transport": "Simulated ELM327 (in-process)", "Latency": String(
-            format: "%.0f–%.0f ms", config.latency.lowerBound * 1_000, config.latency.upperBound * 1_000)])
+        TransportLinkDetails(items: [
+            .init("Transport", "Simulated ELM327 (in-process, no hardware)"),
+            .init("Simulated latency", String(format: "%.0f–%.0f ms",
+                                              config.latency.lowerBound * 1_000, config.latency.upperBound * 1_000)),
+            .init("Scenario", vehicle.scenario.title),
+        ])
     }
 
     // MARK: Emulation

@@ -1,0 +1,54 @@
+name: Redline CI
+
+on:
+  push:
+    paths:
+      - "Redline/**"
+      - ".github/workflows/redline-ci.yml"
+  pull_request:
+    paths:
+      - "Redline/**"
+      - ".github/workflows/redline-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: redline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-tests-linux:
+    name: RedlineCore tests (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.1-noble
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        working-directory: Redline/Packages/RedlineCore
+        run: swift test
+
+  ios-build:
+    name: iOS app build + core tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: RedlineCore tests (macOS)
+        working-directory: Redline/Packages/RedlineCore
+        run: swift test
+      - name: Build Redline for iOS (unsigned)
+        working-directory: Redline
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project Redline.xcodeproj \
+            -scheme Redline \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tee build/xcodebuild.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build/xcodebuild.log
