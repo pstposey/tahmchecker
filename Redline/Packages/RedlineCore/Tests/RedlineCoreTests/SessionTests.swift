@@ -1,0 +1,279 @@
+import Foundation
+import Testing
+@testable import RedlineCore
+
+/// A transport whose replies are scripted per command.
+final class ScriptedTransport: OBDTransport, @unchecked Sendable {
+    enum Reply {
+        case text(String, after: Duration)
+        /// Never answer (simulates a lost prompt).
+        case silence
+    }
+
+    let identity = TransportIdentity(kind: .simulated, name: "Scripted", identifier: "scripted")
+    private let lock = NSLock()
+    private var continuation: AsyncStream<TransportEvent>.Continuation?
+    private var script: (String) -> Reply
+    private(set) var written: [String] = []
+
+    init(script: @escaping (String) -> Reply) {
+        self.script = script
+    }
+
+    func open(log: CommLog) async throws -> AsyncStream<TransportEvent> {
+        let (stream, c) = AsyncStream.makeStream(of: TransportEvent.self)
+        lock.withLock { continuation = c }
+        return stream
+    }
+
+    func write(_ data: Data) async throws {
+        let command = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\r", with: "")
+        let reply = lock.withLock { () -> Reply in
+            written.append(command)
+            return script(command)
+        }
+        guard case .text(let text, let delay) = reply else { return }
+        Task {
+            try? await Task.sleep(for: delay)
+            self.send(text)
+        }
+    }
+
+    func send(_ text: String) {
+        let c = lock.withLock { continuation }
+        // Deliver in small chunks, like BLE notifications.
+        let bytes = Array(text.utf8)
+        var i = 0
+        while i < bytes.count {
+            let end = min(i + 7, bytes.count)
+            c?.yield(.received(Data(bytes[i..<end]), at: ContinuousClock().now))
+            i = end
+        }
+    }
+
+    func disconnect() {
+        let c = lock.withLock { continuation }
+        c?.yield(.closed(.disconnected("test")))
+        c?.finish()
+    }
+
+    func close() async {
+        let c = lock.withLock { continuation }
+        c?.finish()
+    }
+
+    func linkDetails() async -> TransportLinkDetails { TransportLinkDetails() }
+
+    var writtenCommands: [String] { lock.withLock { written } }
+}
+
+@Suite("ELM327 session")
+struct SessionTests {
+    func makeSession(_ transport: ScriptedTransport, timeout: Duration = .milliseconds(300)) async throws -> ELM327Session {
+        var timing = ELM327Session.Timing()
+        timing.defaultTimeout = timeout
+        timing.latePromptGrace = .milliseconds(150)
+        timing.resyncTimeout = .milliseconds(300)
+        let session = ELM327Session(transport: transport, log: CommLog(), timing: timing)
+        await session.start(consuming: try await transport.open(log: session.log))
+        return session
+    }
+
+    @Test func roundTripWithTimestamps() async throws {
+        let t = ScriptedTransport { _ in .text("41 0C 1A F8 \r\r>", after: .milliseconds(20)) }
+        let s = try await makeSession(t)
+        let ex = try await s.execute("010C")
+        #expect(ex.response.lines == ["41 0C 1A F8"])
+        #expect(ex.roundTrip >= .milliseconds(15))
+        #expect(ex.firstByteAt != nil)
+        #expect(ex.firstByteAt! <= ex.completedAt)
+    }
+
+    @Test func concurrentCallersAreSerialized() async throws {
+        let t = ScriptedTransport { cmd in .text("ECHO \(cmd)\r\r>", after: .milliseconds(5)) }
+        let s = try await makeSession(t)
+        try await withThrowingTaskGroup(of: (String, String).self) { group in
+            for i in 0..<20 {
+                group.addTask {
+                    let cmd = String(format: "01%02X", i)
+                    let ex = try await s.execute(cmd)
+                    return (cmd, ex.response.lines.first ?? "")
+                }
+            }
+            for try await (cmd, line) in group {
+                #expect(line == "ECHO \(cmd)") // never another command's response
+            }
+        }
+    }
+
+    @Test func lateResponseIsDiscardedNotMisattributed() async throws {
+        // 0105's answer arrives after its timeout; the next command must get
+        // its own answer, not the late one.
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .text("41 05 82\r\r>", after: .milliseconds(400))
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(10))
+            }
+        }
+        let s = try await makeSession(t, timeout: .milliseconds(250))
+        await #expect(throws: ELMSessionError.timedOut(command: "0105")) {
+            try await s.execute("0105")
+        }
+        let ex = try await s.execute("010C")
+        #expect(ex.response.lines == ["41 0C 1A F8"])
+    }
+
+    @Test func lostPromptRecoveredWithBareCR() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .silence
+            case "": return .text("41 05 82\r\r>", after: .milliseconds(10)) // repeat of 0105
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(10))
+            }
+        }
+        let s = try await makeSession(t)
+        await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
+        let ex = try await s.execute("010C")
+        #expect(ex.response.lines == ["41 0C 1A F8"])
+        #expect(t.writtenCommands == ["0105", "", "010C"])
+    }
+
+    @Test func bareCRRefusedAfterNonRepeatableCommand() async throws {
+        let t = ScriptedTransport { _ in .silence }
+        let s = try await makeSession(t)
+        await #expect(throws: ELMSessionError.self) { try await s.execute("04") }
+        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "04")) { try await s.execute("010C") }
+        #expect(!t.writtenCommands.contains(""))
+    }
+
+    @Test func disconnectFailsPendingRequest() async throws {
+        let t = ScriptedTransport { _ in .silence }
+        let s = try await makeSession(t, timeout: .seconds(5))
+        Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            t.disconnect()
+        }
+        await #expect(throws: ELMSessionError.self) { try await s.execute("010C") }
+        #expect(await s.isClosed)
+        await #expect(throws: ELMSessionError.closed) { try await s.execute("010C") }
+    }
+
+    @Test func cancellationDoesNotHang() async throws {
+        let t = ScriptedTransport { _ in .silence }
+        let s = try await makeSession(t, timeout: .seconds(10))
+        let task = Task { try await s.execute("010C") }
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+        await #expect(throws: ELMSessionError.cancelled) { try await task.value }
+    }
+}
+
+@Suite("Initializer and engine with simulator")
+struct SimulatorIntegrationTests {
+    @Test func initializerAgainstSimulatedAdapter() async throws {
+        let transport = SimulatedELM327Transport()
+        let log = CommLog()
+        let session = ELM327Session(transport: transport, log: log)
+        await session.start(consuming: try await transport.open(log: log))
+
+        let initializer = ELMInitializer()
+        var info = try await initializer.initializeAdapter(session)
+        #expect(info.reportedVersion == "1.5")
+        var support = PIDSupportMap()
+        let link = try await initializer.connectToVehicle(session, info: &info, support: &support)
+        #expect(link == .connected)
+        #expect(info.obdProtocol == .iso_15765_4_can11_500)
+        #expect(info.protocolAutoDetected)
+        #expect(info.responders == [.can11(0x7E8), .can11(0x7E9)])
+        try await initializer.discoverSupport(session, info: info, support: &support)
+        #expect(support.isSupported(0x0C))
+        #expect(support.isSupported(0x33)) // needs range 0x20 query
+        #expect(support.isSupported(0x49)) // needs range 0x40 query
+        #expect(!support.isSupported(0x5C)) // oil temp not simulated
+        #expect(support.ecus(supporting: 0x0C) == [.can11(0x7E8)])
+
+        let effective = try await initializer.applyRequestOptions(
+            session, options: ELMOptions(physicalAddressing: true, responseCountHint: true), info: &info)
+        #expect(effective.physicalAddressing)
+        #expect(info.physicalRequestHeader == "7E0")
+        await session.close()
+    }
+
+    @MainActor
+    @Test func engineStreamsRealPipelineFromSimulator() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmAndBoost)
+        let sim = SimulatedVehicle(scenario: .idle)
+        engine.start(transport: SimulatedELM327Transport(vehicle: sim))
+
+        let rpm = engine.store.channel(.engineRPM)!
+        let boost = engine.store.channel(.boost)!
+        try await waitUntil(seconds: 15) { rpm.sampleCount >= 10 && boost.latest != nil }
+
+        #expect(engine.state == .streaming)
+        #expect(engine.store.sourceKind == .simulated)
+        #expect(rpm.latest!.source == .ecuReported)
+        #expect(rpm.latest!.ecu == .can11(0x7E8))
+        #expect(boost.latest!.source == .calculated)
+        #expect(boost.latest!.derivation?.contains("BARO") == true)
+        // BARO is the simulator's 83 kPa; boost = MAP − 83.
+        let map = engine.store.channel(.manifoldPressure)!.latest!.value
+        #expect(abs(boost.latest!.value - (map - 83)) < 0.001)
+        #expect(engine.store.channel(.oilTemp)!.displayStatus == .unsupported)
+        #expect(engine.polledChannels == [.engineRPM, .manifoldPressure, .barometricPressure, .coolantTemp])
+        let snap = engine.performanceSnapshot()
+        #expect(snap.totalRequests > 0)
+        #expect(snap.medianRoundTripMs != nil)
+        await engine.stop()
+        #expect(engine.state == .idle)
+    }
+
+    @MainActor
+    @Test func boostPullProducesPositivePeak() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmAndBoost)
+        let sim = SimulatedVehicle(scenario: .boostPull)
+        engine.start(transport: SimulatedELM327Transport(vehicle: sim))
+        let boost = engine.store.channel(.boost)!
+        try await waitUntil(seconds: 20) { (boost.peak ?? 0) > 60 }
+        #expect(boost.peak! > 60)
+        engine.store.resetPeaks()
+        #expect(boost.peak == nil)
+        await engine.stop()
+    }
+
+    @MainActor
+    @Test func pollingPresetChangeTakesEffect() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { engine.state == .streaming && !engine.polledChannels.isEmpty }
+        #expect(engine.polledChannels == [.engineRPM])
+        engine.pollingPreset = .turboDashboard
+        try await waitUntil(seconds: 5) { engine.polledChannels.contains(.intakeAirTemp) }
+        let iat = engine.store.channel(.intakeAirTemp)!
+        try await waitUntil(seconds: 5) { iat.latest != nil }
+        await engine.stop()
+    }
+
+    @MainActor
+    @Test func consoleIsReadOnlyAndShared() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { engine.state == .streaming }
+        let ok = await engine.sendConsoleCommand("0105")
+        #expect(ok.contains("41 05"))
+        let blocked = await engine.sendConsoleCommand("04")
+        #expect(blocked.hasPrefix("BLOCKED"))
+        await engine.stop()
+    }
+}
+
+@MainActor
+func waitUntil(seconds: Double, _ condition: @MainActor () -> Bool) async throws {
+    let deadline = ContinuousClock().now + .seconds(seconds)
+    while !condition() {
+        if ContinuousClock().now > deadline {
+            Issue.record("Condition not met within \(seconds) s")
+            return
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}

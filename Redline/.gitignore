@@ -1,0 +1,10 @@
+# SwiftPM / Xcode build products
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+Packages/RedlineCore/Package.resolved
+.DS_Store
