@@ -36,3 +36,14 @@ Four independent reviewers (BLE compile, UI compile, BLE runtime, core lifecycle
 **CI lesson:** two timing-based tests passed locally but failed or proved nothing on the loaded macOS runner. Both were rewritten to be event-driven or deterministic, checked to fail on the pre-fix code, and run repeatedly with all CPUs saturated. **Tests:** 80.
 
 **Next:** the first hardware session (HARDWARE_TEST.md), then fill in BLE.md and record measured RTT and rates here.
+
+## 2026-10-06: Read-only safety audit (before first vehicle connection)
+
+Every outbound path was traced to its sink: two `transport.write` calls in the session, three `writeValue` calls and one `setNotifyValue` in the BLE transport. The full inventory and its effects are in SAFETY.md. Four independent auditors and a critic were planned. Only the sink tracer completed; the others hit the usage limit. Its findings were verified against the code and fixed.
+
+- **No session-level gate.** Before this, only the console filtered input; the session would transmit anything it was handed. Now `ELM327Session.execute` checks every command against `CommandSafetyPolicy`: J1979 read services 01/02/03/06/07/09/0A, at most 7 bytes, plus a fixed AT allowlist. A refused command writes nothing.
+- **`ATSP0` on every connection.** AT SP stores the protocol in the adapter's EEPROM, so each connection was a persistent write. It is now sent only when `ATDPN` shows the adapter isn't already automatic, and the debug report says so when it happens.
+- **Line-break injection.** The gate first evaluated the normalized text, so `"010C\r04"` passed as `010C04`. Our own test caught it. The gate now evaluates the raw text, refuses line breaks and non-`[0-9A-Z@]` characters, and the session sends exactly the evaluated text.
+- **Bare-CR resync.** The ELM327 repeats its last command on a bare CR. Before, that last command could be another app's (e.g. clear codes), or Redline's own `ATSP0`. The CR now requires an answered command from this session **and** that the last command is a read (an OBD read or an informational AT query). The old rule sent `ATE0, ATSP0, CR, ATRV` after a lost `ATSP0` prompt; the regression test shows it now stops at `ATSP0`.
+- **BLE writes to unknown characteristics.** The `ATI` probe and CCCD writes are now limited to recognized ELM327 bridge layouts. An unknown layout fails with nothing written.
+- **Tests that hold the boundary:** exhaustive 256-service check, dangerous AT commands, injection look-alikes, an end-to-end capture of everything the emulated adapter receives, and a source scan pinning every outbound call site. A new write path fails CI until it is reviewed. **Tests:** 98.

@@ -159,9 +159,60 @@ struct ReadOnlySafetyTests {
         }
         for c in commands {
             #expect(CommandSafetyPolicy.evaluateTransmission(c).isAllowed, "\(c)")
-            #expect(CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
         }
         #expect(StandardPIDs.all.allSatisfy { $0.mode == 0x01 })
+    }
+
+    /// A bare CR makes the adapter repeat its last command, so only reads may
+    /// be repeated: OBD read requests and informational AT queries. Commands
+    /// that change adapter or session state — above all the persistent
+    /// `AT SP 0` — never are, even though they are transmittable.
+    @Test func onlyReadsAreRepeatSafe() {
+        let repeatSafe = ["010C", "010C1", "0100", "03", "07", "0A", "0902", "020C00", "0601",
+                          "ATI", "AT@1", "ATRV", "ATDP", "ATDPN", "ATCS", "ATIGN", "at rv"]
+        for c in repeatSafe {
+            #expect(CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
+        }
+        let stateChanging = ["ATZ", "ATE0", "ATL0", "ATS1", "ATH1", "ATSP0", "AT SP 0"]
+            + (0x7E0...0x7E7).map { "ATSH" + String($0, radix: 16, uppercase: true) }
+        for c in stateChanging {
+            #expect(CommandSafetyPolicy.evaluateTransmission(c).isAllowed, "\(c) is still transmittable")
+            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
+        }
+        for (c, what) in Self.dangerousRequests {
+            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c) — \(what)")
+        }
+        for c in Self.dangerousATCommands {
+            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
+        }
+        // Exhaustive over the AT allowlist: repeat-safe ⇔ informational.
+        for body in CommandSafetyPolicy.transmittableATCommands {
+            #expect(CommandSafetyPolicy.isRepeatSafe("AT" + body) == CommandSafetyPolicy.informationalATCommands.contains(body), "AT\(body)")
+        }
+    }
+
+    /// If a state-changing adapter command (here the persistent `AT SP 0`)
+    /// loses its prompt, the session must not send a bare CR — the adapter
+    /// would execute it a second time. It fails the exchange instead, and the
+    /// engine reconnects from a clean `AT Z`.
+    @Test func bareCRNeverRepeatsAStateChangingCommand() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "ATSP0": return .silence
+            default: return .text("OK\r\r>", after: .milliseconds(5))
+            }
+        }
+        var timing = ELM327Session.Timing()
+        timing.defaultTimeout = .milliseconds(200)
+        timing.latePromptGrace = .milliseconds(100)
+        timing.resyncTimeout = .milliseconds(200)
+        let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
+        await s.start(consuming: try await t.open(log: s.log))
+        _ = try await s.execute("ATE0") // answered: the bare-CR rule's first condition holds
+        await #expect(throws: ELMSessionError.timedOut(command: "ATSP0")) { try await s.execute("ATSP0") }
+        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "ATSP0")) { try await s.execute("ATRV") }
+        #expect(t.writtenCommands == ["ATE0", "ATSP0"])
+        #expect(!t.writtenCommands.contains(""))
     }
 }
 

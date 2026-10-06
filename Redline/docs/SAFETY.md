@@ -85,7 +85,7 @@ Unrecognized vendor characteristics, which could be configuration, device-name o
 1. **One gate for every caller.** `ELM327Session.execute` evaluates the caller's raw text with `CommandSafetyPolicy.evaluateTransmission` before taking the adapter. A refused command throws `.commandRefused`, is logged as `REFUSED by read-only policy`, and **nothing is written**. The text sent is exactly the normalized text that was evaluated.
 2. **Allowlists only**: 7 read services, at most 7 bytes (one CAN frame), and a fixed AT-command set. Line breaks, control characters and non-ASCII look-alikes are refused, so one string can never become two adapter commands.
 3. **Stricter console.** The console adds its own allowlist: informational AT commands only, plus the 7 read services.
-4. **Bare-CR resync safety.** The ELM327 repeats its *last* command when it receives a bare CR. Redline sends one only after the adapter has answered at least one command from this session, and only if that command is repeat-safe. So the adapter can never be made to repeat a command left over from another app, e.g. a clear-codes request.
+4. **Bare-CR resync safety.** The ELM327 repeats its *last* command when it receives a bare CR. Redline sends one only after the adapter has answered at least one command from this session, and only if that last command is a **read**: an allowed OBD request or an informational AT query (`I`, `@1`, `RV`, `DP`, `DPN`, `CS`, `IGN`). After `ATZ`, `ATE0`/`ATL0`/`ATS1`/`ATH1`, `ATSH…` or `ATSP0`, the session refuses the CR; the exchange fails and the engine reconnects from a clean `ATZ`. So the adapter can never be made to repeat a command left over from another app (e.g. a clear-codes request), and can never be made to write its stored protocol twice.
 5. **BLE write gating**, described in §2c.
 6. **No path bypasses the session.** The developer console and every engine path go through `TelemetryEngine` → `ELM327Session`. The session object isn't exposed to the UI.
 
@@ -98,7 +98,8 @@ Unrecognized vendor characteristics, which could be configuration, device-name o
 - `transmittableAdapterCommandsAreExactlyTheDocumentedSet`: the AT allowlist equals this document.
 - `injectionAndLookalikeInputsAreRefused`: CR/LF/U+2028/NUL/zero-width/full-width input, over-long requests, malformed suffixes.
 - `sessionRefusesAndWritesNothing`: every dangerous command sent straight to the session; asserts zero bytes reach the transport.
-- `everyBuiltInCommandIsTransmittable`: every command the code can generate passes the gate and is repeat-safe.
+- `everyBuiltInCommandIsTransmittable`: every command the code can generate passes the gate.
+- `onlyReadsAreRepeatSafe` and `bareCRNeverRepeatsAStateChangingCommand`: a bare CR can repeat only a read, never `ATSP0`, `ATZ`, formatting or header commands.
 - `everythingTheAdapterReceivesIsAllowed`: end to end. The real engine runs with all presets and both options, plus hostile console input; every command the emulated adapter received is checked. No `ATSP0` is sent when the adapter is already automatic.
 - `protocolIsStoredOnlyWhenAdapterIsNotAlreadyAutomatic`: the single persistent adapter write happens only when needed and is reported.
 - `bareCRNeverSentBeforeFirstAnsweredCommand`.

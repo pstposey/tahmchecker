@@ -50,7 +50,7 @@ Not sent, on purpose: `ATAT` (adaptive timing; the default is assumed to be on, 
 ## Session robustness (`ELM327Session`)
 
 - One command in flight at a time (FIFO gate). The poller and the console share it safely.
-- **Timeout:** the session marks itself out of sync. Before the next command it waits 400 ms for the late prompt and *discards* that response. If no prompt arrives, it sends a bare CR: an ELM327 that's mid-request aborts with STOPPED, and an idle one repeats the last command. Because of the repeat behaviour, the CR is **refused** after any command `CommandSafetyPolicy.isRepeatSafe` rejects (e.g. `04`). Still no prompt → adapter unresponsive → reconnect.
+- **Timeout:** the session marks itself out of sync. Before the next command it waits 400 ms for the late prompt and *discards* that response. If no prompt arrives, it sends a bare CR: an ELM327 that's mid-request aborts with STOPPED, and an idle one repeats the last command. Because of the repeat behaviour, the CR is sent only after an answered command from this session, and only when the last command is a read (`CommandSafetyPolicy.isRepeatSafe`: an OBD read request or an informational AT query). It is **refused** after `ATZ`, the formatting commands, `ATSH…` and above all the persistent `ATSP0`. Still no prompt → adapter unresponsive → reconnect.
 - **Cancellation** also marks the session out of sync, because the adapter will still answer the abandoned command.
 
 ## Standard PIDs used

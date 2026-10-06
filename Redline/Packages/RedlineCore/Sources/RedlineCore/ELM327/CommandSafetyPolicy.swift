@@ -53,11 +53,16 @@ public enum CommandSafetyPolicy {
     /// Only selects which ECU receives the (still read-only) requests; volatile.
     static let headerATCommands: Set<String> = Set((0x7E0...0x7E7).map { "SH" + String($0, radix: 16, uppercase: true) })
 
+    /// AT commands that only read: identification, description, supply
+    /// voltage, protocol name/number, CAN error counters (CS) and the
+    /// ignition input (IGN). They change nothing, so repeating them is harmless.
+    static let informationalATCommands: Set<String> = ["I", "@1", "RV", "DP", "DPN", "CS", "IGN"]
+
     /// Allowed from the developer console: informational queries only.
     /// Formatting, addressing and reset commands would change what the poller
     /// relies on mid-session, so they are excluded even though harmless to
-    /// the vehicle. CS reads CAN error counters; IGN reads the ignition input.
-    public static let consoleATCommands: Set<String> = ["I", "@1", "RV", "DP", "DPN", "CS", "IGN"]
+    /// the vehicle.
+    public static let consoleATCommands: Set<String> = informationalATCommands
 
     static var transmittableATCommands: Set<String> {
         initializationATCommands.union(headerATCommands).union(consoleATCommands)
@@ -146,9 +151,17 @@ public enum CommandSafetyPolicy {
     }
 
     /// Whether the adapter repeating `command` (it repeats the previous
-    /// command when it receives a bare CR) has no side effects. Everything
-    /// the transmission gate allows is safe to repeat.
+    /// command when it receives a bare CR) has no side effects. Only reads
+    /// qualify: allowed OBD requests and informational AT queries. Every
+    /// other AT command is refused even though it is transmittable — a
+    /// repeated `AT SP 0` would rewrite the adapter's stored protocol, and a
+    /// repeated `AT Z` or formatting command would reset session state.
     public static func isRepeatSafe(_ command: String) -> Bool {
-        evaluateTransmission(command).isAllowed
+        guard evaluateTransmission(command).isAllowed else { return false }
+        let c = normalize(command)
+        if c.hasPrefix("AT") {
+            return informationalATCommands.contains(String(c.dropFirst(2)))
+        }
+        return true // a read-only OBD request (the gate admitted it)
     }
 }
