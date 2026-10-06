@@ -423,18 +423,18 @@ struct ReviewRegressionTests {
 @MainActor
 @Suite("Regression: engine lifecycle")
 struct EngineLifecycleRegressionTests {
-    /// Simulator whose first close() takes a while, so stop() is reliably
-    /// still mid-teardown when the test issues start(), while a newly started
-    /// connection can open meanwhile (later closes are immediate).
+    /// Simulator whose close() takes a while, so stop() is reliably still
+    /// mid-teardown when the test issues start() (the new connection uses a
+    /// different transport). Every close is slow: under heavy CPU load the
+    /// first link can drop by itself before stop(), which used to consume a
+    /// one-off slow close and make the precondition flaky.
     final class SlowCloseTransport: OBDTransport, @unchecked Sendable {
         let inner = SimulatedELM327Transport()
-        private let closes = Locked(0)
         var identity: TransportIdentity { inner.identity }
         func open(log: CommLog) async throws -> AsyncStream<TransportEvent> { try await inner.open(log: log) }
         func write(_ data: Data) async throws { try await inner.write(data) }
         func close() async {
-            let first = closes.withLock { n -> Bool in n += 1; return n == 1 }
-            if first { try? await Task.sleep(for: .seconds(3)) }
+            try? await Task.sleep(for: .seconds(3))
             await inner.close()
         }
         func linkDetails() async -> TransportLinkDetails { await inner.linkDetails() }

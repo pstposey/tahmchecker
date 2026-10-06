@@ -274,6 +274,10 @@ struct OutboundCaptureTests {
         let consoleInputs = ReadOnlySafetyTests.dangerousRequests.map(\.0)
             + ReadOnlySafetyTests.dangerousATCommands + ["010C\r04", "ATZ", "ATSP6", "0105", "03", "0902", "ATRV"]
         engine.pollingPreset = .rpmOnly
+        // The preset change is applied asynchronously and one request from
+        // the previous set may already be in flight: wait for both.
+        try await waitUntil(seconds: 5) { engine.polledChannels == [.engineRPM] }
+        try await Task.sleep(for: .milliseconds(300))
         let beforeConsole = sim.commandsReceived.count
         for input in consoleInputs { _ = await engine.sendConsoleCommand(input) }
         let consolePhase = Array(sim.commandsReceived.dropFirst(beforeConsole)).filter { $0 != "010C" && $0 != "010C1" }
