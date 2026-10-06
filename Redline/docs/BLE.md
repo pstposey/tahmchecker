@@ -22,10 +22,10 @@ No authoritative documentation was found for the GATT layout (searches turned up
 1. **Scan** without a service filter (`scanForPeripherals(withServices: nil)`). The list shows every named device with RSSI and its advertised services. Names containing obd/elm/vlink/vgate/icar get an "OBD?" tag and sort to the top. That's a **hint only**.
 2. **Connect**, then **discover every service and characteristic**. The full GATT table is written to the debug log and the debug report.
 3. **Rank candidate pairs** (`GATTCandidateRanker`): a writable characteristic plus a notify/indicate characteristic in the **same service**, skipping Bluetooth SIG standard services (1800, 1801, 180A, 180F, 1805). Write-without-response and notify rank higher. The commonly reported generic ELM layouts (`FFF0: FFF2→FFF1`, `FFE0: FFE1`, `18F0: 2AF1→2AF0`) only break ties; they're marked UNVERIFIED in code.
-4. **Probe** up to 4 pairs. For each: subscribe to notifications, write `ATI\r`, and wait 1.5 s for a `>`-terminated reply. The first pair that answers is **verified for this connection**. Probe traffic is shown in the raw log as `ATI (probe)`.
+4. **Probe** up to 4 pairs, **but only pairs that match a recognized ELM327 bridge layout** (the list above, plus `E7810A71-…: BEF8D6C9-…`) or the pair previously verified on this adapter. For each: subscribe to notifications, write `ATI\r`, and wait 1.5 s for a `>`-terminated reply. The first pair that answers is **verified for this connection**. Probe traffic is shown in the raw log as `ATI (probe)`. Pairs that don't match are logged as "not probed" and receive **no writes at all**. If nothing matches, connection stops with *Unrecognized adapter Bluetooth layout — nothing was written* (see SAFETY.md).
 5. **Remember** the verified pair (`AppSettings.verifiedLink`) and try it first next time. It's still re-verified by the ELM init (`ATZ` banner).
 
-Probing writes a short, harmless ELM command (`ATI\r`) to characteristics whose purpose isn't documented. That's why probing is limited to 4 pairs, skips standard services, and stops at the first success.
+Probing writes a short, harmless ELM command (`ATI\r`). It's never written to a characteristic of unknown purpose, which on some adapters could be a configuration, name or firmware-update endpoint. That's why only recognized layouts are probed, standard services are skipped, at most 4 pairs are tried, and probing stops at the first success.
 
 ## After the first hardware session, fill in
 

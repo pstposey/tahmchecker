@@ -58,6 +58,8 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
     case connectFailed(String)
     case connectTimedOut
     case noCompatibleCharacteristics
+    /// No recognized ELM327 BLE layout; nothing was written to the adapter.
+    case unrecognizedAdapterLayout
     case disconnected(String?)
     case writeFailed(String)
     case notOpen
@@ -70,6 +72,8 @@ public enum TransportError: Error, Sendable, Equatable, CustomStringConvertible 
         case .connectFailed(let why): return "Connection failed: \(why)"
         case .connectTimedOut: return "Connection timed out"
         case .noCompatibleCharacteristics: return "No characteristic pair answered like an ELM327"
+        case .unrecognizedAdapterLayout:
+            return "Unrecognized adapter Bluetooth layout — nothing was written to it. Share the debug report (it contains the GATT table) so the layout can be verified"
         case .disconnected(let why): return "Disconnected\(why.map { ": \($0)" } ?? "")"
         case .writeFailed(let why): return "Write failed: \(why)"
         case .notOpen: return "Transport is not open"

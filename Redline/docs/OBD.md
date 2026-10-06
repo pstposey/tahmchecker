@@ -22,8 +22,9 @@ Defined in `ELMInitializer.adapterSteps`. Every command has a reason:
 | `ATL0` | OK | Lines end with CR only | CROSS-CHECKED |
 | `ATS1` | OK | Spaces on. With headers on, the spaces keep the 11-bit (`7E8`) and 29-bit (`18 DA F1 10`) formats unambiguous (can327 docs give the same reasoning). Dropping spaces saves ~6 bytes per response; that's a measured experiment for Phase 7, not an assumption | CROSS-CHECKED |
 | `ATH1` | OK | Headers on: identify which ECU answered. On CAN, several ECUs can answer a functional request (7DF) | CROSS-CHECKED |
-| `ATSP0` | OK | Automatic protocol search. Note: `AT SP` also **stores** the protocol in the adapter; 0 (auto) is the factory default | CROSS-CHECKED |
 | `ATI`, `AT@1`, `ATRV` | any | Identification, device description, supply voltage. Informational, failures tolerated | — |
+| `ATDPN` | `0`/`A6`/… | Reads the adapter's current protocol setting | CROSS-CHECKED |
+| `ATSP0` | OK | **Only if** `ATDPN` shows the adapter isn't already automatic. `AT SP` also **stores** the protocol in the adapter (its one persistent setting change; it restores the factory default "automatic"), so Redline avoids it when unnecessary and reports it in the debug report | CROSS-CHECKED |
 | `0100` | data | First OBD request; triggers protocol search (`SEARCHING...`, up to ~12 s timeout). Gives the ECU list and the PIDs 01–20 bitmask | CROSS-CHECKED |
 | `ATDPN`, `ATDP` | `A6` etc. | Which protocol was found. `A` prefix = found automatically | CROSS-CHECKED |
 | `0120`, `0140`, … | data | Remaining support ranges, only while an ECU advertises the next range | CROSS-CHECKED |
@@ -101,11 +102,10 @@ Field references (sanity checks only, from WrenchTime on this car): idle ≈ −
 
 ## Read-only policy
 
-`CommandSafetyPolicy`:
+See **[SAFETY.md](SAFETY.md)** for the complete outbound inventory. In short, `CommandSafetyPolicy` is enforced inside `ELM327Session.execute` for every caller:
 
-- **Console OBD requests:** services 01, 02, 03, 06, 07, 09, 0A, and 22 (UDS read-by-identifier, for future *verified* Mazda PIDs).
-- **Console AT commands:** I, @1, RV, DP, DPN, CS, IGN only. Formatting, addressing and reset commands would desynchronize the poller.
-- **Never allowed:** 04 (clear DTCs; this will get its own confirmation flow), 10/11/14/27/2E/2F/31/34+ (sessions, reset, write, security, actuators, flashing), and the PP/SD/BRD/BRT/LP/SP/MA AT commands.
+- **OBD requests:** only SAE J1979 read services 01, 02, 03, 06, 07, 09 and 0A, at most 7 bytes. Everything else is refused, including 04 (clear DTCs; this will get its own confirmation flow later), 08 (actuator control) and every UDS/KWP service (22 included until Mazda identifiers are verified).
+- **AT commands:** a fixed allowlist (initialization, informational queries, `ATSH7E0`–`7E7`). The console allows only the informational subset (I, @1, RV, DP, DPN, CS, IGN).
 
 ## Mazda-enhanced PIDs
 

@@ -81,18 +81,41 @@ public enum GATTCandidateRanker {
     /// Battery, Current Time). These are excluded from probing.
     public static let standardServices: Set<String> = ["1800", "1801", "180A", "180F", "1805"]
 
-    /// Layouts reported by community sources for generic BLE ELM327 clones.
-    /// UNVERIFIED for the Vgate iCar Pro 2S — used only as a tie-breaker.
+    /// BLE serial-bridge layouts reported by community sources for ELM327
+    /// clones. UNVERIFIED for the Vgate iCar Pro 2S. They serve two purposes:
+    /// ranking, and — more importantly — a WRITE ALLOWLIST: Redline only
+    /// probes (writes `ATI\r` / enables notifications on) a characteristic
+    /// pair that matches one of these layouts or that was previously verified
+    /// for this adapter. An unrecognized layout gets no writes at all; its
+    /// GATT table is logged so the real layout can be verified and added.
     public static let unverifiedCommunityHints: [(service: String, write: String, notify: String)] = [
         ("FFF0", "FFF2", "FFF1"),
         ("FFE0", "FFE1", "FFE1"),
         ("18F0", "2AF1", "2AF0"),
+        ("E7810A71-73AE-499D-8C15-FAA9AEF0C3F2", "BEF8D6C9-9C21-4C9E-B632-BD58C1009F9F", "BEF8D6C9-9C21-4C9E-B632-BD58C1009F9F"),
     ]
 
-    /// Maximum number of pairs the probe will try. Probing writes a harmless
-    /// `ATI\r` to each candidate; bounding attempts limits writes to
-    /// characteristics whose purpose we don't know.
+    /// Maximum number of pairs the probe will try.
     public static let maxProbeAttempts = 4
+
+    public static func isKnownLayout(_ c: GATTLinkCandidate) -> Bool {
+        unverifiedCommunityHints.contains {
+            $0.service == c.serviceUUID && $0.write == c.writeUUID && $0.notify == c.notifyUUID
+        }
+    }
+
+    /// The candidates Redline is willing to write to: the previously verified
+    /// pair (for this adapter) and recognized ELM327 bridge layouts, best
+    /// first, at most `maxProbeAttempts`.
+    public static func probeCandidates(
+        from characteristics: [GATTCharacteristicInfo],
+        preferred: GATTLinkCandidate? = nil
+    ) -> [GATTLinkCandidate] {
+        let eligible = candidates(from: characteristics, preferred: preferred).filter { c in
+            isKnownLayout(c) || (preferred.map { $0.matches(c) } ?? false)
+        }
+        return Array(eligible.prefix(maxProbeAttempts))
+    }
 
     public static func candidates(
         from characteristics: [GATTCharacteristicInfo],

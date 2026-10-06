@@ -10,15 +10,18 @@ public enum ELMSessionError: Error, Sendable, Equatable, CustomStringConvertible
     case resyncRefused(lastCommand: String)
     case transport(TransportError)
     case cancelled
+    /// The read-only safety policy refused the command; nothing was sent.
+    case commandRefused(command: String, reason: String)
 
     public var description: String {
         switch self {
         case .timedOut(let c): return "Timed out waiting for response to \(c)"
         case .closed: return "Session closed"
         case .adapterUnresponsive: return "Adapter unresponsive"
-        case .resyncRefused(let c): return "Cannot resync after non-repeatable command \(c)"
+        case .resyncRefused(let c): return "Cannot resync: adapter's last command is not a known repeat-safe command from this session (last sent: \(c.isEmpty ? "none" : c))"
         case .transport(let e): return e.description
         case .cancelled: return "Cancelled"
+        case .commandRefused(let c, let why): return "Refused \(c): \(why)"
         }
     }
 }
@@ -94,7 +97,13 @@ public actor ELM327Session {
 
     private var needsResync = false
     private var lastCommand = ""
-    private var lastCommandRepeatSafe = true
+    /// False until this session has sent a repeat-safe command. A bare CR
+    /// makes the ELM327 repeat ITS last command, which before our first
+    /// command could be one left by another app.
+    private var lastCommandRepeatSafe = false
+    /// True once the adapter has answered at least one of our commands,
+    /// proving its "last command" is one of ours.
+    private var hasCompletedExchange = false
 
     private let closeContinuation: AsyncStream<TransportError?>.Continuation
     /// Yields once when the underlying link closes, then finishes.
@@ -129,7 +138,18 @@ public actor ELM327Session {
     // MARK: Public API
 
     /// Sends one command and waits for its prompt-terminated response.
+    ///
+    /// Every command passes `CommandSafetyPolicy.evaluateTransmission` first;
+    /// a refused command throws `.commandRefused` and nothing is written. The
+    /// normalized text (exactly what was evaluated) is what goes on the wire.
     public func execute(_ command: String, timeout: Duration? = nil) async throws -> ELMExchange {
+        // Evaluate the caller's raw text (so e.g. embedded line breaks are
+        // refused, not stripped), then send exactly its normalized form.
+        let wire = CommandSafetyPolicy.normalize(command)
+        if case .blocked(let why) = CommandSafetyPolicy.evaluateTransmission(command) {
+            log.error("REFUSED by read-only policy, not sent: \(Self.oneLine(command)) — \(why)")
+            throw ELMSessionError.commandRefused(command: wire, reason: why)
+        }
         await acquire()
         defer { release() }
         if Task.isCancelled { throw ELMSessionError.cancelled }
@@ -144,19 +164,19 @@ public actor ELM327Session {
         framer.reset()
 
         let id = beginPending()
-        armTimeout(id, timeout ?? timing.defaultTimeout, command: command)
-        lastCommand = command
-        lastCommandRepeatSafe = CommandSafetyPolicy.isRepeatSafe(command)
+        armTimeout(id, timeout ?? timing.defaultTimeout, command: wire)
+        lastCommand = wire
+        lastCommandRepeatSafe = CommandSafetyPolicy.isRepeatSafe(wire)
 
         let wallClock = Date()
         let sentAt = clock.now
-        log.record(.tx, command)
+        log.record(.tx, wire)
         do {
-            try await transport.write(Data((command + "\r").utf8))
+            try await transport.write(Data((wire + "\r").utf8))
         } catch {
             abandonPending(id)
             let te = (error as? TransportError) ?? .writeFailed(String(describing: error))
-            log.error("Write failed for \(command): \(te)")
+            log.error("Write failed for \(wire): \(te)")
             throw ELMSessionError.transport(te)
         }
 
@@ -165,16 +185,17 @@ public actor ELM327Session {
             completion = try await awaitCompletion(id)
         } catch let e as ELMSessionError {
             if case .timedOut = e {
-                log.warning("Timeout after \(command) — will resync before next command")
+                log.warning("Timeout after \(wire) — will resync before next command")
             }
             throw e
         }
+        hasCompletedExchange = true
 
-        let response = ELMResponse(raw: completion.text, command: command)
+        let response = ELMResponse(raw: completion.text, command: wire)
         log.record(.rx, completion.text.trimmingCharacters(in: .whitespacesAndNewlines),
                    latency: completion.completedAt - sentAt)
         return ELMExchange(
-            command: command,
+            command: wire,
             response: response,
             sentAt: sentAt,
             firstByteAt: completion.firstByteAt,
@@ -318,8 +339,10 @@ public actor ELM327Session {
             }
             if Task.isCancelled { throw ELMSessionError.cancelled }
         }
-        guard lastCommandRepeatSafe else {
-            log.error("Refusing bare-CR resync: last command \(lastCommand) is not repeat-safe")
+        // A bare CR makes the adapter repeat its last command. Only allowed
+        // when that command provably is one of ours and is repeat-safe.
+        guard hasCompletedExchange, lastCommandRepeatSafe else {
+            log.error("Refusing bare-CR resync: adapter's last command is not known to be a repeat-safe command from this session (last sent: \(lastCommand.isEmpty ? "none" : lastCommand))")
             throw ELMSessionError.resyncRefused(lastCommand: lastCommand)
         }
         log.warning("Resynchronizing: sending bare CR")

@@ -21,6 +21,9 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
         /// Whether the emulated adapter accepts the trailing response-count
         /// digit ("010C1"). Real clones may not; set false to test the fallback.
         public var supportsResponseCountHint = true
+        /// Protocol stored in the emulated adapter's non-volatile memory
+        /// ("0" = automatic). Survives ATZ, like a real ELM327's EEPROM.
+        public var initialStoredProtocol = "0"
         public init() {}
     }
 
@@ -43,6 +46,15 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
     }
 
     private let state = Locked(ELMState())
+    /// Emulated EEPROM: survives ATZ and close/open (like the real adapter).
+    private let storedProtocol: Locked<String>
+    /// Every command the emulator received, in order (for safety tests).
+    private let receivedCommands = Locked<[String]>([])
+
+    /// Commands received so far (bare CR recorded as "").
+    public var commandsReceived: [String] { receivedCommands.withLock { $0 } }
+    /// The emulated adapter's stored protocol setting.
+    public var currentStoredProtocol: String { storedProtocol.withLock { $0 } }
     private let clock = ContinuousClock()
 
     /// PIDs the simulated engine ECU reports as supported.
@@ -51,6 +63,7 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
     public init(vehicle: SimulatedVehicle = SimulatedVehicle(), configuration: Configuration = Configuration()) {
         self.vehicle = vehicle
         self.config = configuration
+        self.storedProtocol = Locked(configuration.initialStoredProtocol)
         self.identity = TransportIdentity(kind: .simulated, name: "Redline Simulator", identifier: "simulator")
         let probe = vehicle.snapshot()
         self.enginePIDs = Set(StandardPIDs.all.filter { vehicle.value(for: $0.id, in: probe) != nil }.map(\.pid))
@@ -81,6 +94,7 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
             }
             return complete
         }
+        receivedCommands.withLock { $0.append(contentsOf: commands) }
         for command in commands {
             let (reply, delay) = respond(to: command)
             Task { [weak self] in
@@ -175,10 +189,18 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
         case "S1": s.spaces = true; return ["OK"]
         case "H0": s.headers = false; return ["OK"]
         case "H1": s.headers = true; return ["OK"]
-        case "DPN": return [s.protocolSearched ? "A6" : "0"]
+        case "DPN":
+            if s.protocolSearched { return ["A6"] }
+            let stored = storedProtocol.withLock { $0 }
+            return [stored == "0" ? "0" : stored]
         case "DP": return [s.protocolSearched ? "AUTO, ISO 15765-4 (CAN 11/500)" : "AUTO"]
         default:
-            if body.hasPrefix("SP") || body.hasPrefix("TP") || body.hasPrefix("ST") || body.hasPrefix("AT") {
+            if body.hasPrefix("SP") {
+                let value = String(body.dropFirst(2))
+                storedProtocol.withLock { $0 = value } // AT SP stores the protocol
+                return ["OK"]
+            }
+            if body.hasPrefix("TP") || body.hasPrefix("ST") || body.hasPrefix("AT") {
                 return ["OK"]
             }
             if body.hasPrefix("SH"), let id = Hex.value(body.dropFirst(2)) {

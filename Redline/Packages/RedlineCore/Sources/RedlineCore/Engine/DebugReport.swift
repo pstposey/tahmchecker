@@ -32,6 +32,8 @@ extension TelemetryEngine {
             out.append("ATDP: \(a.protocolDescription ?? "-")")
             out.append("Responders: \(a.responders.map(\.description).joined(separator: ", "))")
             out.append("Physical header: \(a.physicalRequestHeader ?? "off (functional 7DF)")")
+            out.append("Adapter protocol setting before init: \(a.storedProtocolBeforeInit ?? "-")")
+            out.append("Persistent adapter settings changed this session: \(a.persistentAdapterWrites.isEmpty ? "none" : a.persistentAdapterWrites.joined(separator: ", ")) (never vehicle)")
         } else {
             out.append("(not initialized)")
         }

@@ -32,3 +32,7 @@ Goal: confirm the adapter can be discovered and verified, ELM init succeeds, RPM
 - Anything that looked wrong or didn't happen.
 
 If the adapter doesn't connect, the report's raw log shows which step failed (scan, connect, GATT discovery, probe, ATZ…). Send it even then.
+
+If you see **"Unrecognized adapter Bluetooth layout — nothing was written"**, that's the safety gate working as designed. Redline found no characteristic layout it recognizes as an ELM327 bridge, so it wrote nothing to the adapter. Send the debug report: its GATT table is exactly what's needed to verify and add the Vgate's layout.
+
+Safety: Redline is read-only toward the car (see SAFETY.md). The only thing it can change is the adapter's stored protocol setting, back to the factory "automatic", and only if it isn't already set that way; the debug report says whether that happened.

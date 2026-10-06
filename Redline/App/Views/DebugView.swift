@@ -123,7 +123,7 @@ struct DebugView: View {
                 } header: {
                     Text("ELM console")
                 } footer: {
-                    Text("Read-only: service 01/02/03/06/07/09/0A/22 requests and informational AT commands. Clearing codes and all write services are blocked.")
+                    Text("Read-only: SAE J1979 services 01, 02, 03, 06, 07, 09, 0A and informational AT commands (I, @1, RV, DP, DPN, CS, IGN). Everything else — including clearing codes and every write, control or reset service — is refused and never sent.")
                 }
 
                 Section {

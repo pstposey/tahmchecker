@@ -19,6 +19,12 @@ public struct AdapterInfo: Sendable, Equatable {
     public var headersOn = true
     /// Physical request ID set with ATSH, if physical addressing is active.
     public var physicalRequestHeader: String?
+    /// Protocol setting the adapter reported before Redline changed anything.
+    public var storedProtocolBeforeInit: String?
+    /// Commands this session sent that change PERSISTENT adapter settings
+    /// (only ever `ATSP0`, and only if the adapter wasn't already automatic).
+    /// None of them affects the vehicle.
+    public var persistentAdapterWrites: [String] = []
 
     public init() {}
 }
@@ -89,8 +95,6 @@ public struct ELMInitializer: Sendable {
              timeout: .seconds(2), expectation: .ok),
         Step(command: "ATH1", purpose: "Headers on — identify which ECU answered (several can)",
              timeout: .seconds(2), expectation: .ok),
-        Step(command: "ATSP0", purpose: "Automatic protocol search (factory default; ATSP also stores it)",
-             timeout: .seconds(2), expectation: .ok),
         Step(command: "ATI", purpose: "Identification string (informational)",
              timeout: .seconds(2), expectation: .informational),
         Step(command: "AT@1", purpose: "Device description (informational)",
@@ -134,8 +138,31 @@ public struct ELMInitializer: Sendable {
                 }
             }
         }
+        try await ensureAutomaticProtocol(session, info: &info)
         log.info("Adapter: \(info.resetBanner ?? "?") — reports v\(info.reportedVersion ?? "?")")
         return info
+    }
+
+    /// `AT SP 0` selects automatic protocol search, but AT SP also STORES the
+    /// protocol as the adapter's power-on default (an adapter EEPROM setting;
+    /// it never reaches the vehicle). To avoid touching the adapter's stored
+    /// configuration, Redline first reads the current setting (`AT DPN`) and
+    /// sends `AT SP 0` only when the adapter is not already automatic.
+    func ensureAutomaticProtocol(_ session: ELM327Session, info: inout AdapterInfo) async throws {
+        let log = session.log
+        let dpn = try await session.execute("ATDPN")
+        let current = dpn.response.lines.first
+        info.storedProtocolBeforeInit = current
+        if let current, let parsed = OBDProtocol.parseDPN(current), parsed.proto == .automatic || parsed.automatic {
+            log.info("Adapter protocol already automatic (\(current)); ATSP0 not needed — no adapter settings stored")
+            return
+        }
+        log.warning("Adapter protocol setting is \(current ?? "unknown"), not automatic. Sending ATSP0, which stores 'automatic' as the ADAPTER's default (adapter setting only; nothing is sent to the vehicle)")
+        let ex = try await session.execute("ATSP0")
+        guard ex.response.isOK else {
+            throw ELMInitError.commandRejected(command: "ATSP0", response: ex.response.lines.joined(separator: " "))
+        }
+        info.persistentAdapterWrites.append("ATSP0")
     }
 
     /// Sends 01 00. The first request after ATSP0 triggers protocol search,

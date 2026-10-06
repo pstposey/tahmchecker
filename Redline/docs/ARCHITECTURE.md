@@ -62,7 +62,7 @@ Swift 6 language mode with strict concurrency is enabled for both the package an
 - **Pull-based scheduler.** There's no request queue to grow or go stale, and bandwidth is shared in proportion to 1/target-interval. See POLLING.md.
 - **Simulation at the byte level.** The simulator is an ELM327 emulator behind `OBDTransport`, so simulation exercises the real parser, session and scheduler. Its transport kind is `.simulated`, and the UI shows a SIMULATION badge.
 - **Declarative PIDs.** `PIDFormula.linear(byteOffset:byteCount:scale:offset:)` covers every standard PID used so far. One evaluation function is audited, and the simulator encodes with the exact inverse.
-- **Read-only by construction.** `CommandSafetyPolicy` allowlists read services for the console. The session refuses a bare-CR resync after any non-repeat-safe command, because the ELM327 repeats the previous command when it receives a bare CR.
+- **Read-only by construction.** `ELM327Session.execute` refuses (and never writes) any command `CommandSafetyPolicy` doesn't allowlist, whoever the caller is. Bare-CR resync is only sent after one of the session's own commands has been answered, because the ELM327 repeats its last command when it receives a bare CR. The BLE probe only writes to recognized ELM327 bridge layouts. Full inventory: SAFETY.md.
 - **Persistence:** one JSON blob in `UserDefaults` (`AppSettings`). Dashboards will need a richer store in Phase 10.
 
 ## Error handling summary

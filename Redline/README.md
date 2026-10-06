@@ -41,7 +41,7 @@ If you change `project.yml`, regenerate the project with [XcodeGen](https://gith
 
 - **No fake telemetry.** Every value carries provenance (`ECU_REPORTED`, `CALCULATED`, `ESTIMATED`). Unsupported PIDs show **Unsupported**, never 0. Supported channels with no sample yet show **--**. Old values are marked **STALE** using per-channel thresholds.
 - **Boost = MAP − BARO**, using the vehicle's own BARO. Redline never assumes sea-level pressure; without BARO, boost is unavailable.
-- **Read-only.** The console blocks every non-read service, including clear-DTC (04).
+- **Read-only.** Every outbound command passes one allowlist enforced inside the ELM session: SAE J1979 read services only, no clear-DTC, reset, actuator, security, routine, write or flash services, and no raw CAN. See [SAFETY.md](docs/SAFETY.md).
 - **Measure first.** Every request is timestamped; the Debug tab shows round-trip time, rates and failures. Speed claims need measurements behind them.
 - **Simulation is always labelled** and runs through the same ELM327 parser and scheduler as a real adapter.
 - **Local only.** No accounts, no analytics, no network.
@@ -54,6 +54,7 @@ If you change `project.yml`, regenerate the project with [XcodeGen](https://gith
 | [docs/OBD.md](docs/OBD.md) | ELM327 init sequence and rationale, parsing, PID catalog, boost |
 | [docs/BLE.md](docs/BLE.md) | Vgate BLE interface: what is verified and what isn't, and how discovery works |
 | [docs/POLLING.md](docs/POLLING.md) | Scheduler design, latency instrumentation, experiments to run |
+| [docs/SAFETY.md](docs/SAFETY.md) | **Read-only boundary**: every command Redline can transmit, what it can affect, and the tests that enforce it |
 | [docs/HARDWARE_TEST.md](docs/HARDWARE_TEST.md) | Exact steps for the first in-car test |
 | [docs/DEVLOG.md](docs/DEVLOG.md) | Engineering log |
 

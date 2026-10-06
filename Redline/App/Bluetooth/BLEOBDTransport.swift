@@ -106,11 +106,20 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
             try Task.checkCancellation()
             let table = try await discoverGATT(timeout: 10)
             logGATT(table, to: log)
-            let candidates = GATTCandidateRanker.candidates(from: table, preferred: preferredLink)
-            if candidates.isEmpty {
-                log.error("BLE: no (write, notify) characteristic pair outside standard services")
+            // Safety: only pairs that match a recognized ELM327 bridge layout
+            // (or were verified before for this adapter) are ever written to.
+            // Unknown vendor characteristics (possibly configuration or
+            // firmware-update endpoints) receive no writes at all.
+            let all = GATTCandidateRanker.candidates(from: table, preferred: preferredLink)
+            let candidates = GATTCandidateRanker.probeCandidates(from: table, preferred: preferredLink)
+            for skipped in all where !candidates.contains(where: { $0.matches(skipped) }) {
+                log.info("BLE: not probing unrecognized pair \(skipped.summary) — no data written to it")
             }
-            for candidate in candidates.prefix(GATTCandidateRanker.maxProbeAttempts) {
+            guard !candidates.isEmpty else {
+                log.error("BLE: no recognized ELM327 layout among \(all.count) candidate pairs; nothing was written to the adapter")
+                throw TransportError.unrecognizedAdapterLayout
+            }
+            for candidate in candidates {
                 try Task.checkCancellation()
                 log.info("BLE: probing \(candidate.summary)")
                 if let reply = try await probe(candidate) {

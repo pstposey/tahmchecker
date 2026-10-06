@@ -116,6 +116,7 @@ struct SessionTests {
             }
         }
         let s = try await makeSession(t, timeout: .milliseconds(250))
+        _ = try await s.execute("010C") // an answered command of ours precedes any resync
         await #expect(throws: ELMSessionError.timedOut(command: "0105")) {
             try await s.execute("0105")
         }
@@ -132,18 +133,23 @@ struct SessionTests {
             }
         }
         let s = try await makeSession(t)
+        _ = try await s.execute("010C") // proves the adapter's last command is ours
         await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
         let ex = try await s.execute("010C")
         #expect(ex.response.lines == ["41 0C 1A F8"])
-        #expect(t.writtenCommands == ["0105", "", "010C"])
+        #expect(t.writtenCommands == ["010C", "0105", "", "010C"])
     }
 
-    @Test func bareCRRefusedAfterNonRepeatableCommand() async throws {
+    /// Before any of our commands has been answered, the adapter's "last
+    /// command" may be one left by another app (e.g. a clear-codes request),
+    /// so a bare CR — which makes the ELM327 repeat it — must never be sent.
+    @Test func bareCRNeverSentBeforeFirstAnsweredCommand() async throws {
         let t = ScriptedTransport { _ in .silence }
         let s = try await makeSession(t)
-        await #expect(throws: ELMSessionError.self) { try await s.execute("04") }
-        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "04")) { try await s.execute("010C") }
+        await #expect(throws: ELMSessionError.self) { try await s.execute("ATZ") }
+        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "ATZ")) { try await s.execute("010C") }
         #expect(!t.writtenCommands.contains(""))
+        #expect(t.writtenCommands == ["ATZ"])
     }
 
     @Test func disconnectFailsPendingRequest() async throws {
@@ -486,6 +492,7 @@ struct FixVerificationRegressionTests {
         let t = ScriptedTransport { cmd in
             switch cmd {
             case "": return .text("STOPPED\r\r>", after: .milliseconds(20))
+            case "0100": return .text("41 00 BE 3F A8 13\r\r>", after: .milliseconds(10))
             default: return .silence
             }
         }
@@ -495,6 +502,7 @@ struct FixVerificationRegressionTests {
         timing.resyncTimeout = .milliseconds(300)
         let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
         await s.start(consuming: try await t.open(log: s.log))
+        _ = try await s.execute("0100") // answered, so a bare-CR resync is permitted
         await #expect(throws: ELMSessionError.timedOut(command: "010D")) { try await s.execute("010D") }
         let start = ContinuousClock().now
         Task {
@@ -503,7 +511,7 @@ struct FixVerificationRegressionTests {
             t.disconnect()
         }
         await #expect(throws: ELMSessionError.self) { try await s.execute("010C") }
-        #expect(!t.writtenCommands.contains("010C")) // never written to the dead link
+        #expect(t.writtenCommands == ["0100", "010D", ""]) // 010C never written to the dead link
         #expect(await s.isClosed)
     }
 }
