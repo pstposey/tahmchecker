@@ -2,11 +2,24 @@ import Foundation
 
 /// What kind of link carries the ELM327 byte stream.
 public enum TransportKind: String, Sendable, Codable {
+    /// CoreBluetooth GATT write/notify characteristics (e.g. Vgate iCar Pro 2S).
     case bluetoothLE
+    /// Apple External Accessory framework session (stream pair) to an MFi
+    /// accessory (e.g. OBDLink MX+).
+    case externalAccessory
     /// In-process simulated ELM327 + vehicle. Never real telemetry.
     case simulated
 
     public var isSimulation: Bool { self == .simulated }
+
+    /// Shown in the Connect/Debug screens and the debug report.
+    public var title: String {
+        switch self {
+        case .bluetoothLE: return "Bluetooth LE (CoreBluetooth)"
+        case .externalAccessory: return "MFi accessory (External Accessory framework)"
+        case .simulated: return "SIMULATION"
+        }
+    }
 }
 
 public struct TransportIdentity: Sendable, Equatable {

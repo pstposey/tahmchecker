@@ -90,7 +90,7 @@ public enum CommandSafetyPolicy {
         let responseCount: Character?
     }
 
-    /// Parses "010C", "010C0B11", "010C1" (ELM327 response-count suffix).
+    /// Parses 010C, 010C0B11 and 010C + count digit (ELM327 response-count suffix).
     static func parseOBDRequest(_ normalized: String) -> OBDRequest? {
         guard !normalized.hasPrefix("AT"), normalized.count >= 2 else { return nil }
         var body = normalized
@@ -119,6 +119,52 @@ public enum CommandSafetyPolicy {
         evaluate(command, allowedAT: consoleATCommands)
     }
 
+    /// Raw input may only contain ASCII letters, digits, "@" and spaces. This
+    /// is checked BEFORE normalization, because `uppercased()` turns some
+    /// non-ASCII characters into ASCII ones ("ı" → "I", "ß" → "SS",
+    /// "ﬀ" → "FF"); such look-alikes are refused instead of translated.
+    static func isPlainASCIIInput(_ raw: String) -> Bool {
+        raw.unicodeScalars.allSatisfy { u in
+            let v = u.value
+            return (v >= 0x30 && v <= 0x39) || (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A) || v == 0x40 || v == 0x20
+        }
+    }
+
+    /// Why a TRUNCATED line would be dangerous, or nil if it is harmless.
+    ///
+    /// An ELM327 discards the character that interrupts it (or wakes it from
+    /// low power), and firmware behaviour for the rest of that line is not
+    /// documented anywhere Redline could verify. If a command ever reached a
+    /// busy or sleeping adapter and its first characters were lost, the
+    /// remainder could be executed. The session is designed never to write
+    /// to a busy adapter (see `ELM327Session`); this check makes sure that,
+    /// even if that failed, no remainder of an allowed line is a request that
+    /// can change vehicle state:
+    /// - service 04 in any form (clears DTCs, freeze frame and monitors and
+    ///   needs no parameters), or
+    /// - any other non-read service WITH parameters (e.g. "1101" ECU reset,
+    ///   "10C1" diagnostic session). A lone non-read service byte has no
+    ///   parameters and is rejected by the ECU.
+    /// An odd-length remainder is read both ways: as hex with a trailing
+    /// response-count digit (ELM327 v1.3+), conservatively.
+    static func dangerousTruncation(of normalized: String) -> String? {
+        let chars = Array(normalized)
+        guard chars.count > 1 else { return nil }
+        for drop in 1..<chars.count {
+            let tail = String(chars[drop...])
+            guard tail.allSatisfy(Hex.isHexDigit) else { continue } // "TI", "SP0"…: not a command
+            let even = tail.count % 2 == 0 ? tail : String(tail.dropLast())
+            guard let bytes = Hex.bytes(even), let service = bytes.first else { continue }
+            if service == 0x04 {
+                return "if the adapter lost the first \(drop) character(s) it could execute \"\(tail)\" (service 04: clear diagnostic information)"
+            }
+            if !readOnlyServices.contains(service), bytes.count >= 2 {
+                return String(format: "if the adapter lost the first %d character(s) it could execute \"%@\" (service %02X with parameters)", drop, tail, service)
+            }
+        }
+        return nil
+    }
+
     private static func evaluate(_ command: String, allowedAT: Set<String>) -> Verdict {
         // The adapter ends a command at CR (and some clones at LF). A line
         // break inside one command string can only be a bug or an injection
@@ -126,10 +172,16 @@ public enum CommandSafetyPolicy {
         if command.unicodeScalars.contains(where: { CharacterSet.newlines.contains($0) }) {
             return .blocked("Contains a line break (the adapter would treat it as a command separator)")
         }
+        guard isPlainASCIIInput(command) else {
+            return .blocked("Contains characters other than ASCII letters, digits, @ and spaces (control characters or look-alikes)")
+        }
         let c = normalize(command)
         guard !c.isEmpty else { return .blocked("Empty command") }
         guard isPlainCommandText(c) else {
             return .blocked("Contains characters outside 0-9, A-Z and @ (control characters could split it into several adapter commands)")
+        }
+        if let danger = dangerousTruncation(of: c) {
+            return .blocked("Unsafe if truncated: \(danger)")
         }
         if c.hasPrefix("AT") {
             let body = String(c.dropFirst(2))
@@ -150,18 +202,4 @@ public enum CommandSafetyPolicy {
         return .allowed
     }
 
-    /// Whether the adapter repeating `command` (it repeats the previous
-    /// command when it receives a bare CR) has no side effects. Only reads
-    /// qualify: allowed OBD requests and informational AT queries. Every
-    /// other AT command is refused even though it is transmittable — a
-    /// repeated `AT SP 0` would rewrite the adapter's stored protocol, and a
-    /// repeated `AT Z` or formatting command would reset session state.
-    public static func isRepeatSafe(_ command: String) -> Bool {
-        guard evaluateTransmission(command).isAllowed else { return false }
-        let c = normalize(command)
-        if c.hasPrefix("AT") {
-            return informationalATCommands.contains(String(c.dropFirst(2)))
-        }
-        return true // a read-only OBD request (the gate admitted it)
-    }
 }

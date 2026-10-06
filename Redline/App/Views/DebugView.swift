@@ -61,18 +61,23 @@ struct DebugView: View {
                         ForEach(PollingPreset.allCases) { Text($0.title).tag($0) }
                     }
                     Toggle("Physical addressing (ATSH 7E0)", isOn: $model.settings.elmOptions.physicalAddressing)
-                    Toggle("Response-count hint (\"010C1\")", isOn: $model.settings.elmOptions.responseCountHint)
                     Button("Reconnect to apply") { model.reconnect() }
                 } header: {
                     Text("Polling experiments")
                 } footer: {
-                    Text("Both options are EXPERIMENTAL and off by default. Compare round-trip times with each on/off and share the report.")
+                    Text("Physical addressing is EXPERIMENTAL and off by default. Compare round-trip times with it on/off and share the report. The response-count hint is disabled by the read-only safety policy (a hinted request that lost its first character would become a diagnostic-session request).")
                 }
 
                 Section("Link") {
                     if let id = engine.transportIdentity {
-                        LabeledContent("Source", value: id.kind == .simulated ? "SIMULATION" : "Bluetooth LE")
+                        LabeledContent("Source", value: id.kind.title)
                         LabeledContent("Name", value: id.name)
+                        LabeledContent("Adapter") {
+                            Text(AdapterIdentifier.identify(identity: id, linkDetails: engine.linkDetails,
+                                                            adapterInfo: engine.adapterInfo).summary)
+                                .font(.caption)
+                                .multilineTextAlignment(.trailing)
+                        }
                     }
                     ForEach(engine.linkDetails?.items ?? []) { item in
                         LabeledContent(item.key) {

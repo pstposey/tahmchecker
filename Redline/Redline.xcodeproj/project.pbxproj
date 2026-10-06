@@ -7,13 +7,16 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		00861C7271A7B7E9C161FA53 /* ExternalAccessory.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A9267C1CF11E8066B240831 /* ExternalAccessory.framework */; };
 		12D26FEBD898F0AB5925A7EB /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = F926A73E09F27A701AA37548 /* Theme.swift */; };
 		2444EC9A56E68CB66FE92FCF /* BLECentral.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B3357D12614F1AA5A9821F /* BLECentral.swift */; };
 		28E4E54EB1F0A05E61895F68 /* StatusBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 823056F64CE4A58CE78C39FA /* StatusBanner.swift */; };
+		2D4FDA9688BA96102C4E31BC /* ExternalAccessoryCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25B9A8089822F864D1CAE264 /* ExternalAccessoryCenter.swift */; };
 		49153452EA86921A1E2A883D /* RedlineCore in Frameworks */ = {isa = PBXBuildFile; productRef = 13EA6C1DFA6198E7799B61D9 /* RedlineCore */; };
 		7381F1C142FB3E2F197CA60E /* LiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDEB0BFE1157EB2A7DA1BFF0 /* LiveView.swift */; };
 		7B31A2FDCCFBDCF69D9A00B4 /* DebugView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4F7A4019530990EBC7752C5 /* DebugView.swift */; };
 		82F884421D7DE4D80FFD923B /* RedlineApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A45092FD4626F4F4078A6EAB /* RedlineApp.swift */; };
+		9DCC3690FBCCE1D42DA01515 /* EAStreamSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 437D34BEDDFA9D68CC8AC2CE /* EAStreamSession.swift */; };
 		A0E4B7B76D959625EDE21022 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 066554816508BFE80ED415E7 /* Assets.xcassets */; };
 		AD09ADF4C6CFDA0AC092DCEF /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E6E64EDEA92692A0DB24DEF /* ConnectView.swift */; };
 		BAE4B0F607E95C4ACF6FF0C0 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EA81E419F94CF12F3B4E02E /* AppSettings.swift */; };
@@ -25,8 +28,11 @@
 /* Begin PBXFileReference section */
 		066554816508BFE80ED415E7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1EA81E419F94CF12F3B4E02E /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		25B9A8089822F864D1CAE264 /* ExternalAccessoryCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalAccessoryCenter.swift; sourceTree = "<group>"; };
 		2E6E64EDEA92692A0DB24DEF /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
 		334B27D7BFDB6619B4F25FDC /* GaugeTile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GaugeTile.swift; sourceTree = "<group>"; };
+		437D34BEDDFA9D68CC8AC2CE /* EAStreamSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EAStreamSession.swift; sourceTree = "<group>"; };
+		4A9267C1CF11E8066B240831 /* ExternalAccessory.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ExternalAccessory.framework; path = System/Library/Frameworks/ExternalAccessory.framework; sourceTree = SDKROOT; };
 		77E369CE6531396BD0644322 /* Redline.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Redline.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		801FD73F9F098046E51D9646 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		823056F64CE4A58CE78C39FA /* StatusBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBanner.swift; sourceTree = "<group>"; };
@@ -46,12 +52,21 @@
 			buildActionMask = 2147483647;
 			files = (
 				49153452EA86921A1E2A883D /* RedlineCore in Frameworks */,
+				00861C7271A7B7E9C161FA53 /* ExternalAccessory.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		0537C35C6D7F20829809A771 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				4A9267C1CF11E8066B240831 /* ExternalAccessory.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		4707618540E3D744E35D6824 /* Products */ = {
 			isa = PBXGroup;
 			children = (
@@ -95,11 +110,21 @@
 				B23B743B4B57830BAB03D5E5 /* Info.plist */,
 				A45092FD4626F4F4078A6EAB /* RedlineApp.swift */,
 				F7BB82AD1DD04DBB4FB24F6C /* Bluetooth */,
+				E986123214CAEC9305CCB2AA /* ExternalAccessory */,
 				F09CC7998E47CD5CA417AB9F /* Model */,
 				4AA2C82D25F35721B09A1651 /* Resources */,
 				8B24DBD941B70670E20E4F21 /* Views */,
 			);
 			path = App;
+			sourceTree = "<group>";
+		};
+		E986123214CAEC9305CCB2AA /* ExternalAccessory */ = {
+			isa = PBXGroup;
+			children = (
+				437D34BEDDFA9D68CC8AC2CE /* EAStreamSession.swift */,
+				25B9A8089822F864D1CAE264 /* ExternalAccessoryCenter.swift */,
+			);
+			path = ExternalAccessory;
 			sourceTree = "<group>";
 		};
 		F09CC7998E47CD5CA417AB9F /* Model */ = {
@@ -116,6 +141,7 @@
 			children = (
 				D6EA981FF4F72AC74366AE1B /* App */,
 				B92F3A046CCD03CFBEDAEEE4 /* Packages */,
+				0537C35C6D7F20829809A771 /* Frameworks */,
 				4707618540E3D744E35D6824 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -211,6 +237,8 @@
 				F8E6C4EB4B7C0E5302733E8D /* BLEOBDTransport.swift in Sources */,
 				AD09ADF4C6CFDA0AC092DCEF /* ConnectView.swift in Sources */,
 				7B31A2FDCCFBDCF69D9A00B4 /* DebugView.swift in Sources */,
+				9DCC3690FBCCE1D42DA01515 /* EAStreamSession.swift in Sources */,
+				2D4FDA9688BA96102C4E31BC /* ExternalAccessoryCenter.swift in Sources */,
 				D99BC20CE00449A813DF3906 /* GaugeTile.swift in Sources */,
 				7381F1C142FB3E2F197CA60E /* LiveView.swift in Sources */,
 				82F884421D7DE4D80FFD923B /* RedlineApp.swift in Sources */,

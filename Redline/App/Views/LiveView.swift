@@ -63,8 +63,8 @@ struct LiveView: View {
                 .foregroundStyle(Theme.value)
             Text("Not connected")
                 .foregroundStyle(Theme.label)
-            if model.settings.rememberedAdapterID != nil {
-                Button("Connect to \(model.settings.rememberedAdapterName ?? "adapter")") {
+            if let remembered = model.settings.rememberedAdapter {
+                Button("Connect to \(remembered.displayName)") {
                     model.connectRememberedAdapter()
                 }
                 .buttonStyle(.borderedProminent)

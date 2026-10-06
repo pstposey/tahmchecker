@@ -33,7 +33,7 @@ struct ReadOnlySafetyTests {
         ("2803", "UDS CommunicationControl"),
         ("2C01F200", "UDS DynamicallyDefineDataIdentifier"),
         ("2EF19000", "UDS WriteDataByIdentifier (coding/configuration)"),
-        ("2F0001030", "UDS InputOutputControl (actuators)"),
+        ("2F00010300", "UDS InputOutputControl (actuators)"),
         ("3101FF00", "UDS RoutineControl start"), ("3102FF00", "UDS RoutineControl stop"),
         ("34004400", "UDS RequestDownload (reflash)"), ("35004400", "UDS RequestUpload"),
         ("3601", "UDS TransferData"), ("37", "UDS RequestTransferExit"),
@@ -49,7 +49,6 @@ struct ReadOnlySafetyTests {
         for (request, what) in Self.dangerousRequests {
             #expect(!CommandSafetyPolicy.evaluateTransmission(request).isAllowed, "\(request) — \(what)")
             #expect(!CommandSafetyPolicy.evaluateConsoleCommand(request).isAllowed, "\(request) — \(what)")
-            #expect(!CommandSafetyPolicy.isRepeatSafe(request), "\(request) — \(what)")
         }
     }
 
@@ -99,6 +98,7 @@ struct ReadOnlySafetyTests {
             "010C\r04", "010C\n04", "010C\r\n04", "0100\u{2028}04",   // line breaks → second command
             "010C\u{0}04", "04\u{0}", "AT\u{200B}PP0CSV23",             // NUL / zero-width
             "０１０Ｃ", "０４",                                          // full-width digits
+            "ATıGN", "ATRV\u{0131}", "01ﬀ", "ATSP0ß", "010C\t",       // non-ASCII that uppercases to ASCII; tab
             "01" + String(repeating: "00", count: 7),                  // 8 bytes > one CAN frame
             "010C0", "0", "0G", "0x04",                                // malformed / count digit 0
             "AT", "AT ", "A T P P", "", " ",
@@ -113,8 +113,69 @@ struct ReadOnlySafetyTests {
         // "0" + "4" would read as service 04 if the suffix were mis-parsed.
         #expect(CommandSafetyPolicy.obdService(of: "041") == 0x04)
         #expect(!CommandSafetyPolicy.evaluateTransmission("041").isAllowed)
-        #expect(CommandSafetyPolicy.evaluateTransmission("010C1").isAllowed)
-        #expect(CommandSafetyPolicy.evaluateTransmission("01020304050607").isAllowed) // 7 bytes, 6 PIDs
+    }
+
+    // MARK: Truncation (a busy or waking adapter may lose leading characters)
+
+    /// The auditor's examples: requests whose remainder, after the adapter
+    /// lost their first character(s), would change vehicle state.
+    @Test func linesThatTruncateIntoStateChangingRequestsAreRefused() {
+        let cases: [(String, String)] = [
+            ("0104", "→ 04 clear DTCs"), ("01041", "→ 041 clear DTCs"),
+            ("010C1", "→ 10C1 diagnostic session"), ("01101", "→ 1101 ECU hard reset"),
+            ("014FFFFFF", "→ 14FFFFFF clear diagnostic information"),
+            ("020C00", "→ 20C0 service 20 with parameters"),
+            ("01020304050607", "→ 1020… service 10 with parameters"),
+            ("0904", "→ 04"), ("0A04", "→ 04"), ("0304", "→ 04"),
+        ]
+        for (c, why) in cases {
+            #expect(CommandSafetyPolicy.dangerousTruncation(of: c) != nil, "\(c) \(why)")
+            #expect(!CommandSafetyPolicy.evaluateTransmission(c).isAllowed, "\(c) \(why)")
+            #expect(!CommandSafetyPolicy.evaluateConsoleCommand(c).isAllowed, "\(c) \(why)")
+        }
+    }
+
+    /// Exhaustive: no allowed line, truncated by any number of leading
+    /// characters, is a service 04 request or a non-read request with
+    /// parameters.
+    @Test func noTransmittableLineTruncatesIntoAStateChangingRequest() {
+        var lines = CommandSafetyPolicy.transmittableATCommands.map { "AT" + $0 }
+        for service in CommandSafetyPolicy.readOnlyServices {
+            for b in 0...0xFF {
+                lines.append(Hex.byteString(service) + Hex.byteString(UInt8(b)))
+                lines.append(Hex.byteString(service) + Hex.byteString(UInt8(b)) + "1")
+            }
+            lines.append(Hex.byteString(service))
+        }
+        var allowedCount = 0
+        for line in lines where CommandSafetyPolicy.evaluateTransmission(line).isAllowed {
+            allowedCount += 1
+            let chars = Array(line)
+            for drop in 1..<max(1, chars.count) {
+                let tail = String(chars[drop...])
+                guard tail.allSatisfy(Hex.isHexDigit) else { continue }
+                let even = tail.count % 2 == 0 ? tail : String(tail.dropLast())
+                guard let bytes = Hex.bytes(even), let service = bytes.first else { continue }
+                #expect(service != 0x04, "\(line) truncates to \(tail)")
+                #expect(CommandSafetyPolicy.readOnlyServices.contains(service) || bytes.count == 1,
+                        "\(line) truncates to \(tail)")
+            }
+        }
+        #expect(allowedCount > 1_000)
+    }
+
+    @Test func theResyncProbeIsTransmittableAndHarmlessWhenTruncated() {
+        let probe = ELM327Session.resyncProbe
+        #expect(probe == "ATI")
+        #expect(CommandSafetyPolicy.evaluateTransmission(probe).isAllowed)
+        // Its truncations are not hex, so not requests: "TI", "I".
+        #expect(Array(probe).indices.dropFirst().allSatisfy { i in
+            !String(Array(probe)[i...]).allSatisfy(Hex.isHexDigit)
+        })
+        // A partial line left in the adapter followed by the probe isn't hex.
+        for partial in ["0", "01", "010", "AT", "ATS", "ATSP"] {
+            #expect(!(partial + probe).allSatisfy(Hex.isHexDigit))
+        }
     }
 
     // MARK: Session gate (structural enforcement for every caller)
@@ -146,59 +207,34 @@ struct ReadOnlySafetyTests {
         #expect(t.writtenCommands == ["010C"])
     }
 
-    /// Every command string the code itself can produce passes the gate.
+    /// Every command string the code itself can produce passes the gate,
+    /// except the ones the truncation rule deliberately blocks (PID 04 and
+    /// every response-count-hinted request), which the code never sends.
     @Test func everyBuiltInCommandIsTransmittable() {
         var commands = ELMInitializer.adapterSteps.map(\.command)
-        commands += ["ATDPN", "ATDP", "ATSP0", "0100", "ATI"] // init, discovery, BLE probe
+        commands += ["ATDPN", "ATDP", "ATSP0", "0100", "ATI", ELM327Session.resyncProbe] // init, discovery, BLE probe, resync
         commands += stride(from: 0x20, through: 0xE0, by: 0x20).map { "01" + Hex.byteString(UInt8($0)) }
         commands += (0x7E8...0x7EF).compactMap { ECUAddress.can11(UInt32($0)).physicalRequestID }
             .map { "ATSH" + String($0, radix: 16, uppercase: true) }
-        for def in StandardPIDs.all {
-            commands.append(def.key.requestCommand)
-            commands.append(def.key.requestCommand + "1")
-        }
         for c in commands {
             #expect(CommandSafetyPolicy.evaluateTransmission(c).isAllowed, "\(c)")
         }
+        let blocked = StandardPIDs.all.map(\.key.requestCommand)
+            .filter { !CommandSafetyPolicy.evaluateTransmission($0).isAllowed }
+        #expect(blocked == ["0104"])
+        #expect(StandardPIDs.all.allSatisfy { !CommandSafetyPolicy.evaluateTransmission($0.key.requestCommand + "1").isAllowed })
         #expect(StandardPIDs.all.allSatisfy { $0.mode == 0x01 })
+        #expect(PollingPreset.allCases.allSatisfy { !$0.channels.contains(.engineLoad) })
     }
 
-    /// A bare CR makes the adapter repeat its last command, so only reads may
-    /// be repeated: OBD read requests and informational AT queries. Commands
-    /// that change adapter or session state — above all the persistent
-    /// `AT SP 0` — never are, even though they are transmittable.
-    @Test func onlyReadsAreRepeatSafe() {
-        let repeatSafe = ["010C", "010C1", "0100", "03", "07", "0A", "0902", "020C00", "0601",
-                          "ATI", "AT@1", "ATRV", "ATDP", "ATDPN", "ATCS", "ATIGN", "at rv"]
-        for c in repeatSafe {
-            #expect(CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
-        }
-        let stateChanging = ["ATZ", "ATE0", "ATL0", "ATS1", "ATH1", "ATSP0", "AT SP 0"]
-            + (0x7E0...0x7E7).map { "ATSH" + String($0, radix: 16, uppercase: true) }
-        for c in stateChanging {
-            #expect(CommandSafetyPolicy.evaluateTransmission(c).isAllowed, "\(c) is still transmittable")
-            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
-        }
-        for (c, what) in Self.dangerousRequests {
-            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c) — \(what)")
-        }
-        for c in Self.dangerousATCommands {
-            #expect(!CommandSafetyPolicy.isRepeatSafe(c), "\(c)")
-        }
-        // Exhaustive over the AT allowlist: repeat-safe ⇔ informational.
-        for body in CommandSafetyPolicy.transmittableATCommands {
-            #expect(CommandSafetyPolicy.isRepeatSafe("AT" + body) == CommandSafetyPolicy.informationalATCommands.contains(body), "AT\(body)")
-        }
-    }
-
-    /// If a state-changing adapter command (here the persistent `AT SP 0`)
-    /// loses its prompt, the session must not send a bare CR — the adapter
-    /// would execute it a second time. It fails the exchange instead, and the
-    /// engine reconnects from a clean `AT Z`.
-    @Test func bareCRNeverRepeatsAStateChangingCommand() async throws {
+    /// The session never sends a bare CR (an idle ELM327 repeats its last
+    /// command on one). After a lost prompt — here the persistent `AT SP 0` —
+    /// it probes with `ATI` and only then sends the next command.
+    @Test func resyncNeverRepeatsACommandAndNeverSendsABareCR() async throws {
         let t = ScriptedTransport { cmd in
             switch cmd {
             case "ATSP0": return .silence
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(5))
             default: return .text("OK\r\r>", after: .milliseconds(5))
             }
         }
@@ -208,10 +244,11 @@ struct ReadOnlySafetyTests {
         timing.resyncTimeout = .milliseconds(200)
         let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
         await s.start(consuming: try await t.open(log: s.log))
-        _ = try await s.execute("ATE0") // answered: the bare-CR rule's first condition holds
+        _ = try await s.execute("ATE0")
         await #expect(throws: ELMSessionError.timedOut(command: "ATSP0")) { try await s.execute("ATSP0") }
-        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "ATSP0")) { try await s.execute("ATRV") }
-        #expect(t.writtenCommands == ["ATE0", "ATSP0"])
+        let ex = try await s.execute("ATRV")
+        #expect(ex.response.lines == ["OK"])
+        #expect(t.writtenCommands == ["ATE0", "ATSP0", "ATI", "ATRV"])
         #expect(!t.writtenCommands.contains(""))
     }
 }
@@ -239,7 +276,7 @@ struct OutboundCaptureTests {
         engine.pollingPreset = .rpmOnly
         let beforeConsole = sim.commandsReceived.count
         for input in consoleInputs { _ = await engine.sendConsoleCommand(input) }
-        let consolePhase = Array(sim.commandsReceived.dropFirst(beforeConsole)).filter { $0 != "010C1" }
+        let consolePhase = Array(sim.commandsReceived.dropFirst(beforeConsole)).filter { $0 != "010C" && $0 != "010C1" }
         await engine.stop()
 
         let received = sim.commandsReceived
@@ -361,34 +398,54 @@ struct OutboundSurfaceInventoryTests {
         let sources = try Self.productionSources()
         let message = "Outbound call sites changed — review the new path against docs/SAFETY.md, then update this inventory"
 
-        // Bytes to the adapter: the session (commands + bare-CR resync) only.
-        #expect(Self.sites(#"transport\.write\("#, in: sources) == ["ELM327Session.swift": 2], "\(message)")
-        // GATT writes: BLE probe + write pump (2), and the notification CCCD.
+        // Bytes to the adapter leave the ELM layer at exactly one place: the
+        // session's gated `transmit` (commands and the ATI resync probe).
+        #expect(Self.sites(#"transport\??\.write\("#, in: sources) == ["ELM327Session.swift": 1], "\(message)")
+        // GATT writes (BLE / Vgate): probe + write pump (2) and the CCCD.
         #expect(Self.sites(#"\.writeValue\("#, in: sources) == ["BLEOBDTransport.swift": 3], "\(message)")
         #expect(Self.sites(#"\.setNotifyValue\("#, in: sources) == ["BLEOBDTransport.swift": 1], "\(message)")
         #expect(Self.sites(#"\.writeValue\(\s*Data\("#, in: sources) == ["BLEOBDTransport.swift": 1], "\(message)")
+        // Stream writes (External Accessory / MX+): only the pump writes to
+        // an OutputStream, only the stream transport feeds the pump, and
+        // only one place opens an EASession.
+        #expect(Self.sites(#"\.write\([^)]*maxLength:"#, in: sources) == ["StreamPump.swift": 1], "\(message)")
+        #expect(Self.sites(#"pump\.send\("#, in: sources) == ["AccessoryStreamTransport.swift": 1], "\(message)")
+        #expect(Self.sites(#"EASession\("#, in: sources) == ["ExternalAccessoryCenter.swift": 1], "\(message)")
         // Every command goes through ELM327Session.execute (which enforces the policy).
         #expect(Self.sites(#"\.execute\("#, in: sources) == [
-            "ELMInitializer.swift": 8, "PollingWorker.swift": 1, "TelemetryEngine.swift": 1,
+            "ELMInitializer.swift": 1, "PollingWorker.swift": 1, "TelemetryEngine.swift": 1,
         ], "\(message)")
-        // Only two transports exist.
-        #expect(Self.sites(#"class\s+\w+[^{]*\bOBDTransport\b"#, in: sources) == [
-            "BLEOBDTransport.swift": 1, "SimulatedELM327Transport.swift": 1,
+        // The transports, accessory sessions and connectors that exist.
+        let conformer = #"(class|actor|struct|enum|extension)\s+\w+[^{]*:[^{]*\b%@\b"#
+        #expect(Self.sites(String(format: conformer, "OBDTransport"), in: sources) == [
+            "BLEOBDTransport.swift": 1, "SimulatedELM327Transport.swift": 1, "AccessoryStreamTransport.swift": 1,
         ], "\(message)")
+        #expect(Self.sites(String(format: conformer, "AccessoryStreamSession"), in: sources) == ["EAStreamSession.swift": 1],
+                "\(message)")
+        #expect(Self.sites(String(format: conformer, "AccessoryStreamConnector"), in: sources) == ["ExternalAccessoryCenter.swift": 1],
+                "\(message)")
     }
 
-    /// Every adapter/OBD command literal written in production code passes
-    /// the transmission gate (the simulator, which *parses* commands, and the
-    /// policy itself are excluded).
+    /// Every adapter/OBD-looking string literal in production code (outside
+    /// comments) passes the transmission gate. The only reviewed exceptions
+    /// are the 16-bit GATT UUIDs the BLE ranker recognizes. The simulator
+    /// (which parses commands) and the policy itself are excluded.
     @Test func everyCommandLiteralInSourceIsAllowed() throws {
         let sources = try Self.productionSources().filter {
             !$0.path.contains("/Simulation/") && !$0.path.hasSuffix("CommandSafetyPolicy.swift")
         }
-        let regex = try NSRegularExpression(pattern: #""((?:AT[A-Z0-9@]+)|(?:0[0-9A-F]{3,13}))(?:\\r)?""#)
+        let regex = try NSRegularExpression(pattern: #""((?:[Aa][Tt][A-Za-z0-9@]+)|(?:[0-9A-Fa-f]{2,14}))(?:\\r)?""#)
         var found: [String] = []
         for s in sources {
-            for m in regex.matches(in: s.text, range: NSRange(s.text.startIndex..., in: s.text)) {
-                if let r = Range(m.range(at: 1), in: s.text) { found.append(String(s.text[r])) }
+            for line in s.text.split(separator: "\n") {
+                let code = String(line)
+                if code.trimmingCharacters(in: .whitespaces).hasPrefix("//") { continue }
+                for m in regex.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
+                    guard let r = Range(m.range(at: 1), in: code) else { continue }
+                    let literal = String(code[r])
+                    if s.path.hasSuffix("GATTCandidateRanker.swift"), literal.count == 4 { continue } // GATT UUIDs
+                    found.append(literal)
+                }
             }
         }
         #expect(found.contains("ATZ") && found.contains("0100") && found.contains("ATI"))

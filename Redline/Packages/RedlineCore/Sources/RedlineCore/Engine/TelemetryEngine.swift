@@ -48,7 +48,18 @@ public enum EngineState: Sendable, Equatable {
 @MainActor
 @Observable
 public final class TelemetryEngine {
-    public private(set) var state: EngineState = .idle
+    public private(set) var state: EngineState = .idle {
+        didSet {
+            guard state != oldValue else { return }
+            stateHistory.append(StateTransition(at: Date(), state: state))
+            if stateHistory.count > Self.stateHistoryCapacity {
+                stateHistory.removeFirst(stateHistory.count - Self.stateHistoryCapacity)
+            }
+        }
+    }
+    /// Recent connection-state changes, oldest first (debug report).
+    @ObservationIgnored public private(set) var stateHistory: [StateTransition] = []
+    static let stateHistoryCapacity = 100
     public private(set) var adapterInfo: AdapterInfo?
     public private(set) var support: PIDSupportMap?
     public private(set) var transportIdentity: TransportIdentity?
@@ -76,8 +87,12 @@ public final class TelemetryEngine {
     @ObservationIgnored private var worker: PollingWorker?
     @ObservationIgnored private var transport: (any OBDTransport)?
     @ObservationIgnored private var stalenessTask: Task<Void, Never>?
+    private let initRecorder = InitStepRecorder()
     /// Set when a connection reaches `.streaming`; resets the reconnect backoff.
     @ObservationIgnored private var reachedStreaming = false
+    @ObservationIgnored private var retryRequested = false
+    /// Consecutive `0100` probes the vehicle did not answer.
+    @ObservationIgnored private var unansweredVehicleProbes = 0
 
     public init(
         store: TelemetryStore? = nil,
@@ -161,6 +176,10 @@ public final class TelemetryEngine {
         }
     }
 
+    /// The initialization / vehicle-detection commands of the current link,
+    /// including failed ones (debug report).
+    public var initSteps: [InitStepRecord] { initRecorder.all }
+
     public func performanceSnapshot() -> PerformanceSnapshot {
         monitor.snapshot(now: ContinuousClock().now)
     }
@@ -185,13 +204,45 @@ public final class TelemetryEngine {
             attempt += 1
             state = .reconnecting(attempt: attempt)
             log.info("Reconnecting in \(Self.backoff(attempt)) (\(endReason ?? "link closed"))")
-            try? await Task.sleep(for: Self.backoff(attempt))
+            try? await interruptibleSleep(Self.backoff(attempt))
         }
         if Task.isCancelled { state = .idle }
     }
 
     static func backoff(_ attempt: Int) -> Duration {
         .seconds(min(15, 1 << min(attempt, 4)))
+    }
+
+    /// 3 s for the first five tries (~15 s), then 10 s, then 30 s.
+    static func vehicleRetryDelay(_ unanswered: Int) -> Duration {
+        switch unanswered {
+        case ..<6: return .seconds(3)
+        case 6..<12: return .seconds(10)
+        default: return .seconds(30)
+        }
+    }
+
+    /// Cuts the current reconnect / vehicle-retry wait short (e.g. the app
+    /// returned to the foreground, or the user tapped Retry).
+    public func retryNow() {
+        switch state {
+        case .reconnecting, .vehicleUnavailable, .failed, .disconnected: retryRequested = true
+        default: break
+        }
+    }
+
+    private func interruptibleSleep(_ duration: Duration) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + duration
+        retryRequested = false
+        while clock.now < deadline {
+            if retryRequested {
+                retryRequested = false
+                log.info("Retrying now")
+                return
+            }
+            try await Task.sleep(for: min(.milliseconds(200), deadline - clock.now))
+        }
     }
 
     /// Clears everything learned from a previous link, so the debug screen and
@@ -208,6 +259,7 @@ public final class TelemetryEngine {
     /// One link lifetime. Returns why it ended.
     private func runSingleConnection(_ transport: any OBDTransport) async -> String? {
         clearSessionMetadata()
+        initRecorder.reset()
         state = .connecting
         log.info("Opening \(transport.identity.kind.rawValue) link to \(transport.identity.name)")
         let events: AsyncStream<TransportEvent>
@@ -252,7 +304,7 @@ public final class TelemetryEngine {
         polledChannels = []
         store.setPolledChannels([])
         state = .initializingAdapter
-        let initializer = ELMInitializer()
+        let initializer = ELMInitializer(recorder: initRecorder)
         var info = try await initializer.initializeAdapter(session)
         adapterInfo = info
 
@@ -263,14 +315,20 @@ public final class TelemetryEngine {
             case .connected:
                 break
             case .unavailable(let why):
-                state = .vehicleUnavailable("\(why) — is the ignition on?")
-                try await Task.sleep(for: .seconds(3))
+                // Each unanswered 0100 can make the adapter run its protocol
+                // search (initialization traffic on every OBD protocol), so
+                // retries slow down the longer the vehicle stays silent.
+                unansweredVehicleProbes += 1
+                let wait = Self.vehicleRetryDelay(unansweredVehicleProbes)
+                state = .vehicleUnavailable("\(why) — is the ignition on? Retrying in \(Int(wait.seconds)) s")
+                try await interruptibleSleep(wait)
                 if Task.isCancelled { return .cancelled }
                 continue
             }
             break
         }
 
+        unansweredVehicleProbes = 0
         state = .discoveringPIDs
         try await initializer.discoverSupport(session, info: info, support: &support)
         let effective = try await initializer.applyRequestOptions(session, options: options, info: &info)
@@ -311,6 +369,10 @@ public final class TelemetryEngine {
             let supported = info.physicalRequestHeader != nil
                 ? (support.byECU[.can11(0x7E8)]?.contains(def.pid) ?? false)
                 : support.isSupported(def.pid)
+            if supported, !CommandSafetyPolicy.evaluateTransmission(def.key.requestCommand).isAllowed {
+                updates.append(.support(def.id, .unavailable("Not requested: \"\(def.key.requestCommand)\" is refused by the read-only policy (unsafe if truncated)")))
+                continue
+            }
             updates.append(.support(def.id, supported ? .supported : .unsupported))
         }
         store.apply(updates)

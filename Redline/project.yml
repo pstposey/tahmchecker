@@ -29,6 +29,7 @@ targets:
       - path: App
     dependencies:
       - package: RedlineCore
+      - sdk: ExternalAccessory.framework
     info:
       path: App/Info.plist
       properties:
@@ -36,6 +37,18 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSBluetoothAlwaysUsageDescription: Redline connects to your OBD-II Bluetooth adapter to read live data from your vehicle. Data stays on this iPhone.
+        # MFi (External Accessory) protocol strings for the OBDLink MX+.
+        # UNVERIFIED: neither OBDLink nor Apple publishes the MX+'s string.
+        # com.obdlink is used for OBDLink MFi adapters by two independent
+        # open-source projects; com.scantool.stnobd is attributed by one to
+        # the OBDLink EX (USB). iOS hides accessories whose protocol isn't
+        # listed here, so the first hardware test confirms or corrects these
+        # (the debug report logs every protocol the accessory advertises).
+        # App Store distribution would additionally need OBDLink to approve
+        # Redline's bundle ID; development builds don't (Apple DTS).
+        UISupportedExternalAccessoryProtocols:
+          - com.obdlink
+          - com.scantool.stnobd
         UILaunchScreen:
           UIColorName: ""
         UIApplicationSceneManifest:

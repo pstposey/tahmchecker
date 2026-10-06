@@ -95,7 +95,7 @@ struct SessionTests {
         try await withThrowingTaskGroup(of: (String, String).self) { group in
             for i in 0..<20 {
                 group.addTask {
-                    let cmd = String(format: "01%02X", i)
+                    let cmd = String(format: "01%02X", i + 0x10) // 0110…0123 (never 0104)
                     let ex = try await s.execute(cmd)
                     return (cmd, ex.response.lines.first ?? "")
                 }
@@ -124,32 +124,103 @@ struct SessionTests {
         #expect(ex.response.lines == ["41 0C 1A F8"])
     }
 
-    @Test func lostPromptRecoveredWithBareCR() async throws {
+    @Test func lostPromptRecoveredWithProbe() async throws {
         let t = ScriptedTransport { cmd in
             switch cmd {
             case "0105": return .silence
-            case "": return .text("41 05 82\r\r>", after: .milliseconds(10)) // repeat of 0105
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(10))
             default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(10))
             }
         }
         let s = try await makeSession(t)
-        _ = try await s.execute("010C") // proves the adapter's last command is ours
+        _ = try await s.execute("010C")
         await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
         let ex = try await s.execute("010C")
         #expect(ex.response.lines == ["41 0C 1A F8"])
-        #expect(t.writtenCommands == ["010C", "0105", "", "010C"])
+        #expect(t.writtenCommands == ["010C", "0105", "ATI", "010C"])
     }
 
-    /// Before any of our commands has been answered, the adapter's "last
-    /// command" may be one left by another app (e.g. a clear-codes request),
-    /// so a bare CR — which makes the ELM327 repeat it — must never be sent.
-    @Test func bareCRNeverSentBeforeFirstAnsweredCommand() async throws {
+    /// A silent adapter is probed a bounded number of times and declared
+    /// unresponsive. No bare CR (which repeats whatever the adapter ran
+    /// last, possibly another app's command) is ever sent, and the real
+    /// command is never written to an adapter that might still be busy.
+    @Test func silentAdapterIsProbedThenDeclaredUnresponsive() async throws {
         let t = ScriptedTransport { _ in .silence }
         let s = try await makeSession(t)
         await #expect(throws: ELMSessionError.self) { try await s.execute("ATZ") }
-        await #expect(throws: ELMSessionError.resyncRefused(lastCommand: "ATZ")) { try await s.execute("010C") }
+        await #expect(throws: ELMSessionError.adapterUnresponsive) { try await s.execute("010C") }
         #expect(!t.writtenCommands.contains(""))
-        #expect(t.writtenCommands == ["ATZ"])
+        #expect(t.writtenCommands == ["ATZ", "ATI", "ATI", "ATI", "ATI"])
+    }
+
+    /// The auditor's race: the late prompt arrives just after the session
+    /// gave up waiting. The probe's own answer is followed by that stray
+    /// prompt, so the session probes again instead of writing the next
+    /// command while the adapter's state is uncertain.
+    @Test func strayPromptAfterProbeTriggersAnotherProbe() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .text("41 05 82\r\r>", after: .milliseconds(560)) // after timeout + grace
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(10))
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(10))
+            }
+        }
+        let s = try await makeSession(t) // timeout 300 ms, grace 150 ms, resync 300 ms
+        await #expect(throws: ELMSessionError.timedOut(command: "0105")) { try await s.execute("0105") }
+        let ex = try await s.execute("010C")
+        #expect(ex.response.lines == ["41 0C 1A F8"]) // never the late 0105 answer
+        #expect(t.writtenCommands == ["0105", "ATI", "ATI", "010C"])
+    }
+
+    /// Replies that show the adapter was interrupted or confused ("STOPPED",
+    /// "?", data) are not proof of idleness: the session probes again.
+    @Test func unclearProbeRepliesAreRetried() async throws {
+        let probes = Locked(0)
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .silence
+            case "ATI":
+                let n = probes.withLock { n -> Int in n += 1; return n }
+                switch n {
+                case 1: return .text("STOPPED\r\r>", after: .milliseconds(5))
+                case 2: return .text("?\r\r>", after: .milliseconds(5))
+                default: return .text("ELM327 v1.5\r\r>", after: .milliseconds(5))
+                }
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(5))
+            }
+        }
+        let s = try await makeSession(t)
+        await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
+        _ = try await s.execute("010C")
+        #expect(t.writtenCommands == ["0105", "ATI", "ATI", "ATI", "010C"])
+    }
+
+    /// If a write fails part-way, part of the line may sit in the adapter's
+    /// buffer; the next command must not complete it.
+    @Test func failedWriteForcesAProbeBeforeTheNextCommand() async throws {
+        final class FlakyWriteTransport: OBDTransport, @unchecked Sendable {
+            let inner: ScriptedTransport
+            let failNext = Locked(false)
+            init(_ inner: ScriptedTransport) { self.inner = inner }
+            var identity: TransportIdentity { inner.identity }
+            func open(log: CommLog) async throws -> AsyncStream<TransportEvent> { try await inner.open(log: log) }
+            func write(_ data: Data) async throws {
+                if failNext.withLock({ let v = $0; $0 = false; return v }) { throw TransportError.writeFailed("test") }
+                try await inner.write(data)
+            }
+            func close() async { await inner.close() }
+            func linkDetails() async -> TransportLinkDetails { TransportLinkDetails() }
+        }
+        let t = ScriptedTransport { cmd in
+            cmd == "ATI" ? .text("ELM327 v1.5\r\r>", after: .milliseconds(5)) : .text("41 0C 1A F8\r\r>", after: .milliseconds(5))
+        }
+        let flaky = FlakyWriteTransport(t)
+        let s = ELM327Session(transport: flaky, log: CommLog())
+        await s.start(consuming: try await flaky.open(log: s.log))
+        flaky.failNext.withLock { $0 = true }
+        await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
+        _ = try await s.execute("010C")
+        #expect(t.writtenCommands == ["ATI", "010C"])
     }
 
     @Test func disconnectFailsPendingRequest() async throws {
@@ -314,12 +385,11 @@ struct ReviewRegressionTests {
     }
 
     /// A late answer still arriving when the grace period ends must be waited
-    /// for, not followed by a bare CR whose repeat would shift every response.
-    @Test func noBareCRWhileLateResponseIsInProgress() async throws {
+    /// for, not interrupted by a probe.
+    @Test func noProbeWhileLateResponseIsInProgress() async throws {
         let t = ScriptedTransport { cmd in
             switch cmd {
             case "010C": return .silence
-            case "": return .text("41 0C 1A F8\r\r>", after: .milliseconds(60))
             case "010D": return .text("41 0D 32\r\r>", after: .milliseconds(120))
             default: return .silence
             }
@@ -336,7 +406,7 @@ struct ReviewRegressionTests {
         }
         let ex = try await s.execute("010D")
         #expect(ex.response.lines == ["41 0D 32"])
-        #expect(t.writtenCommands == ["010C", "010D"]) // no bare CR was needed
+        #expect(t.writtenCommands == ["010C", "010D"]) // no probe was needed
     }
 
     @Test func cancellationDuringResyncIsReportedAsCancelled() async throws {
@@ -486,12 +556,12 @@ struct StoreAccuracyRegressionTests {
 
 @Suite("Regression: fix verification")
 struct FixVerificationRegressionTests {
-    /// A link drop during the post-CR absorb wait must surface as a link
+    /// A link drop during the post-probe quiet wait must surface as a link
     /// failure, not let the next command be written to a closed transport.
     @Test func linkLossDuringResyncIsReportedNotSwallowed() async throws {
         let t = ScriptedTransport { cmd in
             switch cmd {
-            case "": return .text("STOPPED\r\r>", after: .milliseconds(20))
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(20))
             case "0100": return .text("41 00 BE 3F A8 13\r\r>", after: .milliseconds(10))
             default: return .silence
             }
@@ -502,16 +572,16 @@ struct FixVerificationRegressionTests {
         timing.resyncTimeout = .milliseconds(300)
         let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
         await s.start(consuming: try await t.open(log: s.log))
-        _ = try await s.execute("0100") // answered, so a bare-CR resync is permitted
+        _ = try await s.execute("0100")
         await #expect(throws: ELMSessionError.timedOut(command: "010D")) { try await s.execute("010D") }
         let start = ContinuousClock().now
         Task {
-            // grace (300) + CR reply (~20) puts us inside the absorb wait.
+            // grace (300) + probe reply (~20) puts us inside the quiet wait.
             try? await ContinuousClock().sleep(until: start + .milliseconds(420))
             t.disconnect()
         }
         await #expect(throws: ELMSessionError.self) { try await s.execute("010C") }
-        #expect(t.writtenCommands == ["0100", "010D", ""]) // 010C never written to the dead link
+        #expect(t.writtenCommands == ["0100", "010D", "ATI"]) // 010C never written to the dead link
         #expect(await s.isClosed)
     }
 }

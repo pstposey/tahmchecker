@@ -36,11 +36,14 @@ public struct ELMOptions: Sendable, Codable, Equatable {
     /// answered on 0x7E8, address it physically (ATSH 7E0) instead of the
     /// functional broadcast 0x7DF, so only that ECU answers.
     public var physicalAddressing = false
-    /// Append the expected number of responses ("010C1") so the ELM327
+    /// Append the expected number of responses (010C → 010C1) so the ELM327
     /// returns as soon as that many replies arrive instead of waiting for its
     /// response timeout (ELM327 v1.3+ feature; clones may not implement it).
-    /// Applied only when exactly one ECU can answer. Disabled automatically
-    /// if the adapter rejects it with "?".
+    ///
+    /// DISABLED by the read-only policy: every hinted request "01PP1" would,
+    /// if the adapter lost its first character, become "1PP1" — a service
+    /// 10/11 request with parameters (diagnostic session, ECU reset). The
+    /// setting is kept for compatibility and always resolves to off.
     public var responseCountHint = false
 
     public init(physicalAddressing: Bool = false, responseCountHint: Bool = false) {
@@ -108,14 +111,37 @@ public struct ELMInitializer: Sendable {
         case unavailable(String)
     }
 
-    public init() {}
+    /// Receives every command of the sequence as it happens (for the debug
+    /// report), including the ones that fail.
+    public let recorder: InitStepRecorder?
+
+    public init(recorder: InitStepRecorder? = nil) {
+        self.recorder = recorder
+    }
+
+    /// Every initializer command goes through here, and from here through
+    /// `ELM327Session.execute` (the read-only gate).
+    private func exchange(_ session: ELM327Session, _ command: String, timeout: Duration? = nil) async throws -> ELMExchange {
+        do {
+            let ex = try await session.execute(command, timeout: timeout)
+            recorder?.record(InitStepRecord(command: ex.command, outcome: .answered,
+                                            detail: ex.response.lines.joined(separator: " | "),
+                                            roundTripMs: ex.roundTrip.milliseconds, at: ex.wallClock))
+            return ex
+        } catch {
+            recorder?.record(InitStepRecord(command: CommandSafetyPolicy.normalize(command), outcome: .failed,
+                                            detail: (error as? ELMSessionError)?.description ?? String(describing: error),
+                                            roundTripMs: nil, at: Date()))
+            throw error
+        }
+    }
 
     public func initializeAdapter(_ session: ELM327Session) async throws -> AdapterInfo {
         var info = AdapterInfo()
         let log = session.log
         log.info("Initializing adapter")
         for step in Self.adapterSteps {
-            let ex = try await session.execute(step.command, timeout: step.timeout)
+            let ex = try await exchange(session, step.command, timeout: step.timeout)
             let r = ex.response
             switch step.expectation {
             case .banner:
@@ -150,15 +176,20 @@ public struct ELMInitializer: Sendable {
     /// sends `AT SP 0` only when the adapter is not already automatic.
     func ensureAutomaticProtocol(_ session: ELM327Session, info: inout AdapterInfo) async throws {
         let log = session.log
-        let dpn = try await session.execute("ATDPN")
-        let current = dpn.response.lines.first
-        info.storedProtocolBeforeInit = current
-        if let current, let parsed = OBDProtocol.parseDPN(current), parsed.proto == .automatic || parsed.automatic {
+        let dpn = try await exchange(session, "ATDPN")
+        let reply = dpn.response.lines.first
+        info.storedProtocolBeforeInit = reply
+        guard let current = reply, let parsed = OBDProtocol.parseDPN(current) else {
+            // Can't tell what is stored, so don't overwrite it.
+            log.warning("Adapter protocol setting unreadable (\(reply ?? "no reply")); leaving it unchanged — ATSP0 not sent")
+            return
+        }
+        if parsed.proto == .automatic || parsed.automatic {
             log.info("Adapter protocol already automatic (\(current)); ATSP0 not needed — no adapter settings stored")
             return
         }
-        log.warning("Adapter protocol setting is \(current ?? "unknown"), not automatic. Sending ATSP0, which stores 'automatic' as the ADAPTER's default (adapter setting only; nothing is sent to the vehicle)")
-        let ex = try await session.execute("ATSP0")
+        log.warning("Adapter protocol setting is \(current), not automatic. Sending ATSP0, which stores 'automatic' as the ADAPTER's default (adapter setting only; nothing is sent to the vehicle)")
+        let ex = try await exchange(session, "ATSP0")
         guard ex.response.isOK else {
             throw ELMInitError.commandRejected(command: "ATSP0", response: ex.response.lines.joined(separator: " "))
         }
@@ -168,7 +199,7 @@ public struct ELMInitializer: Sendable {
     /// Sends 01 00. The first request after ATSP0 triggers protocol search,
     /// which can take several seconds ("SEARCHING...").
     public func connectToVehicle(_ session: ELM327Session, info: inout AdapterInfo, support: inout PIDSupportMap) async throws -> VehicleLink {
-        let ex = try await session.execute("0100", timeout: .seconds(12))
+        let ex = try await exchange(session, "0100", timeout: .seconds(12))
         let r = ex.response
         let parsed = OBDFrameParser.parse(lines: r.hexLines, headersOn: info.headersOn, protocol: info.obdProtocol)
         let key = PIDKey(mode: 0x01, pid: 0x00)
@@ -184,12 +215,12 @@ public struct ELMInitializer: Sendable {
         info.responders = support.respondingECUs
 
         // Protocol actually in use.
-        if let dpn = try? await session.execute("ATDPN"), let line = dpn.response.lines.first,
+        if let dpn = try? await exchange(session, "ATDPN"), let line = dpn.response.lines.first,
            let parsedDPN = OBDProtocol.parseDPN(line) {
             info.obdProtocol = parsedDPN.proto
             info.protocolAutoDetected = parsedDPN.automatic
         }
-        if let dp = try? await session.execute("ATDP") {
+        if let dp = try? await exchange(session, "ATDP") {
             info.protocolDescription = dp.response.lines.first
         }
         session.log.info("Vehicle responded. Protocol: \(info.obdProtocol?.displayName ?? "?"); ECUs: \(info.responders.map(\.description).joined(separator: ", "))")
@@ -201,7 +232,7 @@ public struct ELMInitializer: Sendable {
     public func discoverSupport(_ session: ELM327Session, info: AdapterInfo, support: inout PIDSupportMap) async throws {
         while let base = support.nextRangeToQuery() {
             let key = PIDKey(mode: 0x01, pid: base)
-            let ex = try await session.execute(key.requestCommand, timeout: .seconds(3))
+            let ex = try await exchange(session, key.requestCommand, timeout: .seconds(3))
             let parsed = OBDFrameParser.parse(lines: ex.response.hexLines, headersOn: info.headersOn, protocol: info.obdProtocol)
             let payloads = OBDResponseDecoder.positivePayloads(for: key, in: parsed.messages)
             support.markQueried(base: base)
@@ -218,12 +249,17 @@ public struct ELMInitializer: Sendable {
     public func applyRequestOptions(_ session: ELM327Session, options: ELMOptions, info: inout AdapterInfo) async throws -> ELMOptions {
         var effective = options
         info.physicalRequestHeader = nil
+        let hintedRPM = PIDKey(mode: 0x01, pid: 0x0C).requestCommand + "1"
+        if options.responseCountHint, !CommandSafetyPolicy.evaluateTransmission(hintedRPM).isAllowed {
+            effective.responseCountHint = false
+            session.log.warning("Response-count hint disabled by the read-only policy: truncated, \(hintedRPM) would become a diagnostic-session request")
+        }
         if options.physicalAddressing {
             let engineECU = ECUAddress.can11(0x7E8)
             if info.obdProtocol?.canIDBits == 11, info.responders.contains(engineECU),
                let request = engineECU.physicalRequestID {
                 let header = String(format: "%03X", request)
-                let ex = try await session.execute("ATSH\(header)")
+                let ex = try await exchange(session, "ATSH\(header)")
                 if ex.response.isOK {
                     info.physicalRequestHeader = header
                     session.log.info("Physical addressing enabled (ATSH\(header))")

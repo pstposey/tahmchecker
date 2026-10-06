@@ -14,6 +14,9 @@ extension TelemetryEngine {
         out.append("State: \(state.title)\(state.detail.map { " — \($0)" } ?? "")")
         if let id = transportIdentity {
             out.append("Source: \(id.kind == .simulated ? "SIMULATION" : id.kind.rawValue) — \(id.name) [\(id.identifier)]")
+            out.append("Transport: \(id.kind.title)")
+            let identification = AdapterIdentifier.identify(identity: id, linkDetails: linkDetails, adapterInfo: adapterInfo)
+            out.append("Adapter identified as: \(identification.summary) [name-based, unverified]")
         }
 
         out.append("")
@@ -39,6 +42,24 @@ extension TelemetryEngine {
         }
         if let o = effectiveOptions {
             out.append("Options: physicalAddressing=\(o.physicalAddressing) responseCountHint=\(o.responseCountHint)")
+        }
+
+        out.append("")
+        out.append("== Initialization (current link) ==")
+        let steps = initSteps
+        if steps.isEmpty { out.append("(no commands yet)") }
+        let clockTime = DateFormatter()
+        clockTime.locale = Locale(identifier: "en_US_POSIX")
+        clockTime.dateFormat = "HH:mm:ss.SSS"
+        for step in steps {
+            let rtt = step.roundTripMs.map { String(format: "%.0f ms", $0) } ?? "-"
+            out.append("\(clockTime.string(from: step.at))  \(step.command)  \(step.outcome.rawValue)  \(rtt)  \(step.detail)")
+        }
+
+        out.append("")
+        out.append("== Connection state history (last \(stateHistory.count)) ==")
+        for t in stateHistory {
+            out.append("\(clockTime.string(from: t.at))  \(t.summary)")
         }
 
         out.append("")

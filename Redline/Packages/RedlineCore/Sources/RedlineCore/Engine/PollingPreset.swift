@@ -7,6 +7,8 @@ public enum PollingPreset: String, Sendable, Codable, CaseIterable, Identifiable
     /// Milestone 2: RPM + boost inputs + coolant sanity check.
     case rpmAndBoost
     /// Default turbo dashboard: Boost, RPM, Load, Throttle, Pedal, Coolant, IAT.
+    /// Load is PID 43 (absolute load): PID 04's request (01 04) is refused by
+    /// the read-only policy because its last two characters are "04".
     case turboDashboard
     /// Secondary diagnostic set.
     case diagnostic
@@ -29,7 +31,7 @@ public enum PollingPreset: String, Sendable, Codable, CaseIterable, Identifiable
         case .rpmAndBoost:
             return [.engineRPM, .manifoldPressure, .barometricPressure, .coolantTemp]
         case .turboDashboard:
-            return [.engineRPM, .manifoldPressure, .barometricPressure, .engineLoad, .throttlePosition,
+            return [.engineRPM, .manifoldPressure, .barometricPressure, .absoluteLoad, .throttlePosition,
                     .acceleratorPedalD, .coolantTemp, .intakeAirTemp]
         case .diagnostic:
             return [.engineRPM, .manifoldPressure, .barometricPressure, .shortTermFuelTrim1, .longTermFuelTrim1,

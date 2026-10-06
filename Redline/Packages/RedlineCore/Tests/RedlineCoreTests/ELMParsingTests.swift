@@ -173,12 +173,11 @@ struct CommandSafetyTests {
         }
     }
 
-    @Test func repeatSafety() {
-        #expect(CommandSafetyPolicy.isRepeatSafe("010C"))
-        #expect(CommandSafetyPolicy.isRepeatSafe("010C1")) // with response-count digit
-        #expect(CommandSafetyPolicy.isRepeatSafe("ATRV"))
-        #expect(!CommandSafetyPolicy.isRepeatSafe("04"))
-        #expect(!CommandSafetyPolicy.isRepeatSafe("ATPP0CSV23"))
+    @Test func truncationSafety() {
+        #expect(CommandSafetyPolicy.dangerousTruncation(of: "010C") == nil)
+        #expect(CommandSafetyPolicy.dangerousTruncation(of: "ATRV") == nil)
+        #expect(CommandSafetyPolicy.dangerousTruncation(of: "0104") != nil) // → "04"
+        #expect(CommandSafetyPolicy.dangerousTruncation(of: "010C1") != nil) // → "10C1"
         #expect(CommandSafetyPolicy.obdService(of: "010C1") == 0x01)
     }
 }

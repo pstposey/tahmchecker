@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import RedlineCore
 import SwiftUI
+import UIKit
 
 /// Composition root: owns the telemetry engine and decides which transport
 /// feeds it. Views never talk to transports or the ELM session directly.
@@ -10,6 +11,7 @@ import SwiftUI
 final class AppModel {
     let engine: TelemetryEngine
     let bluetooth = BluetoothModel()
+    let accessories = AccessoryModel()
 
     var settings: AppSettings {
         didSet {
@@ -29,15 +31,26 @@ final class AppModel {
     private(set) var simulatedVehicle: SimulatedVehicle?
 
     @ObservationIgnored private var bleCentral: BLECentral?
+    @ObservationIgnored private var accessoryCenter: ExternalAccessoryCenter?
     @ObservationIgnored private var launched = false
+    /// The MFi session was closed because the app went to the background;
+    /// reconnect when it returns.
+    @ObservationIgnored private var resumeOnForeground = false
 
     var isSimulationActive: Bool { simulatedVehicle != nil }
 
+    /// App, iOS and device versions (for the debug report: EA behaviour
+    /// differs between iOS releases).
     var appVersion: String {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "Redline \(version) (\(build))"
+        var system = utsname()
+        uname(&system)
+        let machine = withUnsafeBytes(of: &system.machine) { raw in
+            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return "Redline \(version) (\(build)) · \(UIDevice.current.systemName) \(UIDevice.current.systemVersion) · \(machine)"
     }
 
     init() {
@@ -55,7 +68,7 @@ final class AppModel {
         case .simulation:
             startSimulation()
         case .vehicle:
-            if settings.autoConnect, settings.rememberedAdapterID != nil {
+            if settings.autoConnect, settings.rememberedAdapter != nil {
                 connectRememberedAdapter()
             }
         }
@@ -70,32 +83,46 @@ final class AppModel {
         engine.start(transport: SimulatedELM327Transport(vehicle: vehicle))
     }
 
+    /// Connects to a BLE adapter found by scanning (Vgate iCar Pro 2S).
     func connect(to adapter: DiscoveredAdapter) {
         let central = ensureBLE()
         central.stopScan()
-        if settings.rememberedAdapterID != adapter.id {
-            settings.verifiedLink = nil
+        var link: GATTLinkCandidate?
+        if case .bluetoothLE(let id, _, let verified) = settings.rememberedAdapter, id == adapter.id {
+            link = verified // keep the verified GATT pair only for the same adapter
         }
-        settings.rememberedAdapterID = adapter.id
-        settings.rememberedAdapterName = adapter.displayName
+        settings.rememberedAdapter = .bluetoothLE(id: adapter.id, name: adapter.displayName, verifiedLink: link)
         settings.dataSource = .vehicle
-        startBLE(central: central, id: adapter.id, name: adapter.displayName)
+        startBLE(central: central, id: adapter.id, name: adapter.displayName, link: link)
+    }
+
+    /// Connects to an MFi accessory iOS already has connected (OBDLink MX+).
+    func connect(toAccessory accessory: AccessoryDescriptor) {
+        bleCentral?.stopScan()
+        settings.rememberedAdapter = .externalAccessory(accessory.remembered)
+        settings.dataSource = .vehicle
+        startAccessory(accessory.remembered)
     }
 
     func connectRememberedAdapter() {
-        guard let id = settings.rememberedAdapterID else { return }
         settings.dataSource = .vehicle
-        startBLE(central: ensureBLE(), id: id, name: settings.rememberedAdapterName ?? "OBD adapter")
+        switch settings.rememberedAdapter {
+        case .bluetoothLE(let id, let name, let link)?:
+            startBLE(central: ensureBLE(), id: id, name: name, link: link)
+        case .externalAccessory(let accessory)?:
+            startAccessory(accessory)
+        case nil:
+            return
+        }
     }
 
     func forgetAdapter() {
-        settings.rememberedAdapterID = nil
-        settings.rememberedAdapterName = nil
-        settings.verifiedLink = nil
+        settings.rememberedAdapter = nil
     }
 
     func disconnect() {
         simulatedVehicle = nil
+        resumeOnForeground = false
         Task { await engine.stop() }
     }
 
@@ -111,9 +138,13 @@ final class AppModel {
     func startScan() { ensureBLE().startScan() }
     func stopScan() { bleCentral?.stopScan() }
 
-    /// Bluetooth is only initialized when needed, so simulation-only use never
-    /// triggers the Bluetooth permission prompt.
+    /// Bluetooth LE is only initialized when needed, so simulation-only or
+    /// MX+-only use never triggers the Bluetooth permission prompt.
     func prepareBluetooth() { _ = ensureBLE() }
+
+    /// Starts watching for MFi accessories (no permission prompt involved).
+    func prepareAccessories() { _ = ensureAccessoryCenter() }
+    func refreshAccessories() { ensureAccessoryCenter().refresh() }
 
     private func ensureBLE() -> BLECentral {
         if let bleCentral { return bleCentral }
@@ -122,20 +153,41 @@ final class AppModel {
         return central
     }
 
-    private func startBLE(central: BLECentral, id: UUID, name: String) {
+    private func ensureAccessoryCenter() -> ExternalAccessoryCenter {
+        if let accessoryCenter { return accessoryCenter }
+        let center = ExternalAccessoryCenter(model: accessories)
+        accessoryCenter = center
+        return center
+    }
+
+    private func startBLE(central: BLECentral, id: UUID, name: String, link: GATTLinkCandidate?) {
         simulatedVehicle = nil
         let transport = BLEOBDTransport(
-            central: central, peripheralID: id, name: name, preferredLink: settings.verifiedLink,
+            central: central, peripheralID: id, name: name, preferredLink: link,
             onLinkVerified: { [weak self] link in
                 Task { @MainActor in
                     // A superseded transport must not stamp its link onto
                     // whichever adapter is remembered now.
-                    guard let self, self.settings.rememberedAdapterID == id else { return }
-                    self.settings.verifiedLink = link
+                    guard let self, case .bluetoothLE(let rid, let rname, _) = self.settings.rememberedAdapter,
+                          rid == id else { return }
+                    self.settings.rememberedAdapter = .bluetoothLE(id: rid, name: rname, verifiedLink: link)
                 }
             }
         )
         engine.start(transport: transport)
+    }
+
+    private func startAccessory(_ accessory: RememberedAccessory) {
+        simulatedVehicle = nil
+        let connector = ExternalAccessoryConnector(center: ensureAccessoryCenter(), target: .remembered(accessory))
+        let identity = TransportIdentity(
+            kind: .externalAccessory,
+            name: accessory.name.isEmpty ? "MFi accessory" : accessory.name,
+            identifier: accessory.serialNumber.isEmpty ? accessory.modelNumber : accessory.serialNumber)
+        // OBDLink: the adapter can take up to about a minute to appear after
+        // it is plugged in; the engine keeps retrying after each timeout.
+        engine.start(transport: AccessoryStreamTransport(identity: identity, connector: connector,
+                                                         connectTimeout: .seconds(30), openTimeout: .seconds(5)))
     }
 
     // MARK: App lifecycle
@@ -144,10 +196,27 @@ final class AppModel {
         switch phase {
         case .active:
             engine.setPaused(false)
+            // Accessory notifications are queued and coalesced while the app
+            // is suspended: re-read the list instead of trusting them.
+            accessoryCenter?.refresh()
+            if resumeOnForeground {
+                resumeOnForeground = false
+                connectRememberedAdapter()
+            } else {
+                engine.retryNow()
+            }
         case .background:
-            // Without a Bluetooth background mode iOS suspends the app; stop
-            // requesting so no command is left half-finished at suspension.
-            engine.setPaused(true)
+            if engine.transportIdentity?.kind == .externalAccessory, engine.state != .idle, !engine.isStopping {
+                // Without the external-accessory background mode, iOS ends
+                // accessory sessions when the app is backgrounded. Close ours
+                // cleanly now and open a fresh one on return.
+                resumeOnForeground = true
+                Task { await engine.stop() }
+            } else {
+                // BLE: without a Bluetooth background mode iOS suspends the
+                // app; stop requesting so no command is left half-finished.
+                engine.setPaused(true)
+            }
         default:
             break
         }

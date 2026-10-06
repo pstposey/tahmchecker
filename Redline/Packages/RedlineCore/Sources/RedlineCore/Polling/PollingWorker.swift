@@ -65,6 +65,8 @@ public actor PollingWorker {
 
     func isPollable(_ def: PIDDefinition) -> Bool {
         guard def.mode == 0x01 else { return false }
+        // e.g. PID 04 (engine load): unsafe if the adapter truncated its request.
+        guard CommandSafetyPolicy.evaluateTransmission(def.key.requestCommand).isAllowed else { return false }
         if context.info.physicalRequestHeader != nil {
             return context.support.byECU[.can11(0x7E8)]?.contains(def.pid) ?? false
         }
@@ -183,12 +185,15 @@ public actor PollingWorker {
                        completedAt: ex.completedAt, decodedAt: decodedAt, outcome: outcome)
     }
 
-    /// "010C", or "010C1" when the response-count hint applies.
+    /// 010C, or 010C + "1" when the response-count hint applies and the
+    /// hinted form passes the read-only policy (it currently never does:
+    /// see `ELMInitializer.applyRequestOptions`).
     func requestCommand(for def: PIDDefinition) -> String {
         let base = def.key.requestCommand
         guard context.options.responseCountHint else { return base }
         let singleResponder = context.info.physicalRequestHeader != nil
             || context.support.ecus(supporting: def.pid).count == 1
-        return singleResponder ? base + "1" : base
+        let hinted = base + "1"
+        return singleResponder && CommandSafetyPolicy.evaluateTransmission(hinted).isAllowed ? hinted : base
     }
 }

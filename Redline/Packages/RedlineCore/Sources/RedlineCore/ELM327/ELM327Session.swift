@@ -3,11 +3,8 @@ import Foundation
 public enum ELMSessionError: Error, Sendable, Equatable, CustomStringConvertible {
     case timedOut(command: String)
     case closed
-    /// The adapter did not return a prompt even after a resync attempt.
+    /// The adapter did not confirm it was idle even after resync attempts.
     case adapterUnresponsive
-    /// A timed-out command was not safe to repeat, so the bare-CR resync
-    /// (which makes an idle ELM327 repeat the last command) was refused.
-    case resyncRefused(lastCommand: String)
     case transport(TransportError)
     case cancelled
     /// The read-only safety policy refused the command; nothing was sent.
@@ -18,7 +15,6 @@ public enum ELMSessionError: Error, Sendable, Equatable, CustomStringConvertible
         case .timedOut(let c): return "Timed out waiting for response to \(c)"
         case .closed: return "Session closed"
         case .adapterUnresponsive: return "Adapter unresponsive"
-        case .resyncRefused(let c): return "Cannot resync: adapter's last command is not a known repeat-safe command from this session (last sent: \(c.isEmpty ? "none" : c))"
         case .transport(let e): return e.description
         case .cancelled: return "Cancelled"
         case .commandRefused(let c, let why): return "Refused \(c): \(why)"
@@ -54,16 +50,23 @@ public struct ELMExchange: Sendable {
 /// Timeouts and resynchronization: if a response does not arrive in time,
 /// the session marks itself out of sync. Before the next command it first
 /// waits briefly for the late prompt (whose response is discarded so it can
-/// never be attributed to the next command). If none arrives it sends a bare
-/// CR — the ELM327 either aborts the stuck request ("STOPPED") or, if idle,
-/// repeats the last command. Repeating is only acceptable for read-only
-/// requests, so the bare-CR step is refused after any command that
-/// `CommandSafetyPolicy` does not consider repeat-safe.
+/// never be attributed to the next command). If none arrives, the adapter's
+/// state is unknown — it may still be busy, or its prompt was lost — and a
+/// command written now could reach a busy adapter. An ELM327 discards the
+/// character that interrupts it and might act on the rest of the line, so
+/// the session first sends the probe `ATI` (every truncation of which, "TI"
+/// or "I", is meaningless to the adapter) until it gets a clean answer
+/// followed by silence. Only then is the next real command written.
+///
+/// A bare CR is never sent: an idle ELM327 repeats its last command on a
+/// bare CR, and that command could be a truncated or foreign one.
 public actor ELM327Session {
     public struct Timing: Sendable {
         public var defaultTimeout: Duration = .milliseconds(2_000)
         public var latePromptGrace: Duration = .milliseconds(400)
         public var resyncTimeout: Duration = .milliseconds(1_500)
+        /// Probe attempts before the adapter is declared unresponsive.
+        public var resyncProbeAttempts = 4
         public init() {}
     }
 
@@ -96,14 +99,6 @@ public actor ELM327Session {
     private var timeoutTask: Task<Void, Never>?
 
     private var needsResync = false
-    private var lastCommand = ""
-    /// False until this session has sent a repeat-safe command. A bare CR
-    /// makes the ELM327 repeat ITS last command, which before our first
-    /// command could be one left by another app.
-    private var lastCommandRepeatSafe = false
-    /// True once the adapter has answered at least one of our commands,
-    /// proving its "last command" is one of ours.
-    private var hasCompletedExchange = false
 
     private let closeContinuation: AsyncStream<TransportError?>.Continuation
     /// Yields once when the underlying link closes, then finishes.
@@ -165,16 +160,18 @@ public actor ELM327Session {
 
         let id = beginPending()
         armTimeout(id, timeout ?? timing.defaultTimeout, command: wire)
-        lastCommand = wire
-        lastCommandRepeatSafe = CommandSafetyPolicy.isRepeatSafe(wire)
 
         let wallClock = Date()
         let sentAt = clock.now
         log.record(.tx, wire)
         do {
-            try await transport.write(Data((wire + "\r").utf8))
+            try await transmit(wire)
         } catch {
             abandonPending(id)
+            // Part of the line may have reached the adapter; resync before
+            // anything else is written so it can't be completed by our next
+            // command.
+            needsResync = true
             let te = (error as? TransportError) ?? .writeFailed(String(describing: error))
             log.error("Write failed for \(wire): \(te)")
             throw ELMSessionError.transport(te)
@@ -189,7 +186,6 @@ public actor ELM327Session {
             }
             throw e
         }
-        hasCompletedExchange = true
 
         let response = ELMResponse(raw: completion.text, command: wire)
         log.record(.rx, completion.text.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -202,6 +198,16 @@ public actor ELM327Session {
             completedAt: completion.completedAt,
             wallClock: wallClock
         )
+    }
+
+    /// The only place bytes are written to the adapter: one gated command
+    /// line plus CR. The policy is re-checked here (defense in depth; every
+    /// caller already passed it), so nothing can bypass it.
+    private func transmit(_ wire: String) async throws {
+        guard CommandSafetyPolicy.evaluateTransmission(wire).isAllowed, wire == CommandSafetyPolicy.normalize(wire) else {
+            throw ELMSessionError.commandRefused(command: wire, reason: "not transmittable")
+        }
+        try await transport.write(Data((wire + "\r").utf8))
     }
 
     public func close() async {
@@ -329,8 +335,7 @@ public actor ELM327Session {
         }
         if Task.isCancelled { throw ELMSessionError.cancelled }
         // Part of the late answer has arrived: the adapter is still printing,
-        // not stuck. A CR now could reach it after its prompt, making an idle
-        // ELM327 repeat the command and shifting every later response by one.
+        // not stuck. Let it finish rather than interrupt it.
         if framer.hasPartialResponse {
             log.warning("Resynchronizing: late response in progress, waiting for it to finish")
             if try await waitForPrompt(timing.resyncTimeout) {
@@ -339,30 +344,68 @@ public actor ELM327Session {
             }
             if Task.isCancelled { throw ELMSessionError.cancelled }
         }
-        // A bare CR makes the adapter repeat its last command. Only allowed
-        // when that command provably is one of ours and is repeat-safe.
-        guard hasCompletedExchange, lastCommandRepeatSafe else {
-            log.error("Refusing bare-CR resync: adapter's last command is not known to be a repeat-safe command from this session (last sent: \(lastCommand.isEmpty ? "none" : lastCommand))")
-            throw ELMSessionError.resyncRefused(lastCommand: lastCommand)
-        }
-        log.warning("Resynchronizing: sending bare CR")
-        framer.reset()
-        do {
-            try await transport.write(Data("\r".utf8))
-        } catch {
-            throw ELMSessionError.transport((error as? TransportError) ?? .writeFailed(String(describing: error)))
-        }
-        if try await waitForPrompt(timing.resyncTimeout) {
-            // If the late prompt and the CR's own reply crossed, a second
-            // prompt follows; absorb it so it can't complete the next command.
-            _ = try await waitForPrompt(timing.latePromptGrace)
+        try await confirmIdle()
+        needsResync = false
+    }
+
+    /// The resync probe. Its truncations ("TI", "I") are not commands, so
+    /// sending it to an adapter that may be busy is harmless; any partial
+    /// line left in the adapter's buffer plus "ATI" is not hex either.
+    static let resyncProbe = "ATI"
+
+    /// Sends the probe until the adapter answers it with plain text and then
+    /// stays quiet, which proves it is idle and in step with us.
+    private func confirmIdle() async throws {
+        for attempt in 1...max(1, timing.resyncProbeAttempts) {
             if Task.isCancelled { throw ELMSessionError.cancelled }
-            needsResync = false
+            if isClosed { throw ELMSessionError.closed }
+            framer.reset()
+            let id = beginPending()
+            armTimeout(id, timing.resyncTimeout, command: Self.resyncProbe)
+            log.record(.tx, Self.resyncProbe + " (resync probe \(attempt))")
+            do {
+                try await transmit(Self.resyncProbe)
+            } catch {
+                abandonPending(id)
+                if let e = error as? ELMSessionError { throw e }
+                throw ELMSessionError.transport((error as? TransportError) ?? .writeFailed(String(describing: error)))
+            }
+            let reply: Completion
+            do {
+                reply = try await awaitCompletion(id)
+            } catch let error as ELMSessionError {
+                switch error {
+                case .transport, .cancelled, .closed: throw error
+                default:
+                    if isClosed { throw ELMSessionError.closed }
+                    log.warning("Resync probe \(attempt): no prompt")
+                    continue
+                }
+            }
+            let response = ELMResponse(raw: reply.text, command: Self.resyncProbe)
+            log.record(.rx, reply.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard Self.isCleanProbeReply(response) else {
+                log.warning("Resync probe \(attempt): reply was not a clean identification (adapter still settling)")
+                continue
+            }
+            // Something still in flight would produce one more prompt; it
+            // must not complete the next command.
+            if try await waitForPrompt(timing.latePromptGrace) {
+                log.warning("Resync probe \(attempt): another prompt followed; probing again")
+                continue
+            }
+            if Task.isCancelled { throw ELMSessionError.cancelled }
+            log.info("Resynchronized: adapter idle")
             return
         }
-        if Task.isCancelled { throw ELMSessionError.cancelled }
-        log.error("Adapter did not return a prompt after resync")
+        log.error("Adapter did not confirm it was idle after \(timing.resyncProbeAttempts) probes")
         throw ELMSessionError.adapterUnresponsive
+    }
+
+    /// Identification text only: no hex data, no "?", "STOPPED", "NO DATA"
+    /// or other adapter message.
+    static func isCleanProbeReply(_ r: ELMResponse) -> Bool {
+        r.firstTextLine != nil && r.hexLines.isEmpty && !r.hasMessages && !r.searched
     }
 
     /// Waits for one prompt and discards its response. Returns false when
@@ -371,10 +414,10 @@ public actor ELM327Session {
     private func waitForPrompt(_ timeout: Duration) async throws -> Bool {
         if isClosed { throw ELMSessionError.closed }
         let id = beginPending()
-        armTimeout(id, timeout, command: "<resync>")
+        armTimeout(id, timeout, command: "<late prompt>")
         do {
             let c = try await awaitCompletion(id)
-            log.info("Resync discarded: \(Self.oneLine(c.text))")
+            log.info("Resync discarded late response: \(Self.oneLine(c.text))")
             return true
         } catch let error as ELMSessionError {
             if case .transport = error { throw error }
