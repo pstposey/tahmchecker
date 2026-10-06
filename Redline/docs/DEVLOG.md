@@ -31,4 +31,8 @@ Four independent reviewers (BLE compile, UI compile, BLE runtime, core lifecycle
 - **Fixed in the BLE layer** (compile-verified; runtime needs hardware): Bluetooth power-off/reset not propagated to the transport (could hang a write) and stale peripherals reused after a reset; connect/notify timers from earlier attempts failing later ones; our own disconnect completing and failing an immediate reconnect; a link loss during probing misreported as "no ELM reply"; `open()` not cancellable during discovery/probing.
 - **App:** the verified GATT link is bound to the adapter it was probed on; the keep-awake toggle applies immediately.
 
+**Second pass (over the fix commit):** three reviewers plus skeptics. Three findings were confirmed and fixed: a link loss during resync was read as "no prompt", so the next command was written to a closed link (regression test added); a disconnect during the last probe candidate's cleanup was still misreported as "no ELM reply"; and the Bluetooth power-on wait wasn't cancellable. Three findings were refuted, including a deliberate trade-off: after a lost prompt, waiting out a late reply makes recovery slower (~3.4 s vs ~1.5 s), but it prevents responses from being attributed to the wrong PID.
+
+**CI lesson:** two timing-based tests passed locally but failed or proved nothing on the loaded macOS runner. Both were rewritten to be event-driven or deterministic, checked to fail on the pre-fix code, and run repeatedly with all CPUs saturated. **Tests:** 80.
+
 **Next:** the first hardware session (HARDWARE_TEST.md), then fill in BLE.md and record measured RTT and rates here.
