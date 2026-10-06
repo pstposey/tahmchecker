@@ -74,6 +74,8 @@ public final class TelemetryEngine {
     @ObservationIgnored private var worker: PollingWorker?
     @ObservationIgnored private var transport: (any OBDTransport)?
     @ObservationIgnored private var stalenessTask: Task<Void, Never>?
+    /// Set when a connection reaches `.streaming`; resets the reconnect backoff.
+    @ObservationIgnored private var reachedStreaming = false
 
     public init(
         store: TelemetryStore? = nil,
@@ -107,14 +109,26 @@ public final class TelemetryEngine {
     }
 
     /// Stops polling and closes the link.
+    ///
+    /// The teardown is itself stored as `connectionTask`, so a `start()`
+    /// issued while `stop()` is still waiting chains after it instead of
+    /// racing it (and `stop()` never closes a transport started meanwhile).
     public func stop() async {
         let task = connectionTask
-        connectionTask = nil
         task?.cancel()
-        await session?.close()
-        await task?.value
-        if let transport { await transport.close() }
-        transport = nil
+        let session = self.session
+        let transport = self.transport
+        self.transport = nil
+        let teardown = Task { @MainActor in
+            await session?.close()
+            await task?.value
+            await transport?.close()
+        }
+        connectionTask = teardown
+        await teardown.value
+        guard connectionTask == teardown else { return } // a newer start() owns the engine now
+        connectionTask = nil
+        clearSessionMetadata()
         state = .idle
     }
 
@@ -152,11 +166,14 @@ public final class TelemetryEngine {
     private func runConnectionLoop(_ transport: any OBDTransport) async {
         store.resetSession(sourceKind: transport.identity.kind)
         monitor.reset()
+        clearSessionMetadata()
         transportIdentity = transport.identity
         var attempt = 0
         while !Task.isCancelled {
+            reachedStreaming = false
             let endReason = await runSingleConnection(transport)
             if Task.isCancelled { break }
+            if reachedStreaming { attempt = 0 } // backoff restarts after a good session
             guard autoReconnect else {
                 state = .disconnected(endReason)
                 break
@@ -173,8 +190,20 @@ public final class TelemetryEngine {
         .seconds(min(15, 1 << min(attempt, 4)))
     }
 
+    /// Clears everything learned from a previous link, so the debug screen and
+    /// report never attribute one source's adapter/vehicle facts to another.
+    private func clearSessionMetadata() {
+        adapterInfo = nil
+        support = nil
+        effectiveOptions = nil
+        linkDetails = nil
+        polledChannels = []
+        store.setPolledChannels([])
+    }
+
     /// One link lifetime. Returns why it ended.
     private func runSingleConnection(_ transport: any OBDTransport) async -> String? {
+        clearSessionMetadata()
         state = .connecting
         log.info("Opening \(transport.identity.kind.rawValue) link to \(transport.identity.name)")
         let events: AsyncStream<TransportEvent>
@@ -214,6 +243,10 @@ public final class TelemetryEngine {
     }
 
     private func runVehicleSession(_ session: ELM327Session) async throws -> PollingWorker.StopReason {
+        support = nil
+        effectiveOptions = nil
+        polledChannels = []
+        store.setPolledChannels([])
         state = .initializingAdapter
         let initializer = ELMInitializer()
         var info = try await initializer.initializeAdapter(session)
@@ -242,14 +275,20 @@ public final class TelemetryEngine {
         effectiveOptions = effective
         publishSupport(support, info: info)
 
-        let worker = PollingWorker(session: session, monitor: monitor,
-                                   context: .init(info: info, support: support, options: effective))
+        let worker = PollingWorker(
+            session: session, monitor: monitor,
+            context: .init(info: info, support: support, options: effective),
+            onOptionsChanged: { [weak self] changed in
+                Task { @MainActor in self?.effectiveOptions = changed }
+            }
+        )
         self.worker = worker
         defer { self.worker = nil }
         await worker.setPaused(isPaused)
         await applyPollingSet()
 
         state = .streaming
+        reachedStreaming = true
         let (stream, continuation) = AsyncStream.makeStream(of: [TelemetryUpdate].self,
                                                             bufferingPolicy: .bufferingNewest(512))
         let consumer = Task { @MainActor [store] in

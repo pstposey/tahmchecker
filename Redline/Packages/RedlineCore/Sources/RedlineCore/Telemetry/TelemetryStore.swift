@@ -63,13 +63,14 @@ public final class TelemetryStore {
     /// BARO. It inherits the MAP sample's timing (it is that measurement,
     /// re-expressed as gauge pressure). See `BoostCalculator`.
     private func deriveBoost(fromMAP map: TelemetrySample, now: MonotonicInstant) {
-        guard let boost = channels[.boost] else { return }
-        guard let baro = channels[.barometricPressure]?.latest else {
-            if case .unsupported = channels[.barometricPressure]?.support {
-                boost.setSupport(.unavailable("Requires BARO (PID 33), which this vehicle does not report"))
-            }
+        guard let boost = channels[.boost], let baroState = channels[.barometricPressure] else { return }
+        // Never fall back to a cached BARO the current vehicle link says it
+        // does not report (e.g. after reconnecting to a different car).
+        if case .unsupported = baroState.support {
+            boost.setSupport(.unavailable("Requires BARO (PID 33), which this vehicle does not report"))
             return
         }
+        guard let baro = baroState.latest else { return }
         let value = BoostCalculator.gaugePressure(manifoldAbsolute: map.value, barometric: baro.value)
         let baroAge = (map.timing.receivedAt - baro.timing.receivedAt).seconds
         let sample = TelemetrySample(

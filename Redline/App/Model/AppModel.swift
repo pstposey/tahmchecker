@@ -127,7 +127,12 @@ final class AppModel {
         let transport = BLEOBDTransport(
             central: central, peripheralID: id, name: name, preferredLink: settings.verifiedLink,
             onLinkVerified: { [weak self] link in
-                Task { @MainActor in self?.settings.verifiedLink = link }
+                Task { @MainActor in
+                    // A superseded transport must not stamp its link onto
+                    // whichever adapter is remembered now.
+                    guard let self, self.settings.rememberedAdapterID == id else { return }
+                    self.settings.verifiedLink = link
+                }
             }
         )
         engine.start(transport: transport)

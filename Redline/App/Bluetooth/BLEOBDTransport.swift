@@ -48,7 +48,14 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
     private var pendingServiceDiscoveries = 0
     private var discoveryWaiter: CheckedContinuation<[GATTCharacteristicInfo], Error>?
     private var notifyWaiter: CheckedContinuation<Void, Error>?
+    /// Per-request tokens: a timer armed for one request must never fail a
+    /// later request within the same open().
+    private var notifyRequest = 0
+    private var notifyTarget: CBCharacteristic?
     private var probeWaiter: CheckedContinuation<String?, Never>?
+    private var probeRequest = 0
+    /// Generation whose open() was cancelled; new waiters for it bail out.
+    private var cancelledGeneration = -1
     private var probeNotifyKey: String?
     private var probeFramer = ELMResponseFramer()
     private var link: GATTLinkCandidate?
@@ -72,7 +79,7 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
     // MARK: OBDTransport
 
     func open(log: CommLog) async throws -> AsyncStream<TransportEvent> {
-        await onQueue {
+        let generation = await onQueue { () -> Int in
             self.generation += 1
             self.log = log
             self.mode = .opening
@@ -80,12 +87,23 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
             self.link = nil
             self.writeCharacteristic = nil
             self.notifyCharacteristic = nil
+            return self.generation
         }
+        return try await withTaskCancellationHandler {
+            try await openSteps(log: log)
+        } onCancel: {
+            self.queue.async { self.abortOpen(generation: generation) }
+        }
+    }
+
+    private func openSteps(log: CommLog) async throws -> AsyncStream<TransportEvent> {
         try await central.waitUntilPoweredOn(timeout: 5)
+        try Task.checkCancellation()
         log.info("BLE: connecting to \(identity.name) [\(peripheralID.uuidString)]")
         try await central.connect(peripheralID, observer: self, timeout: 12)
         log.info("BLE: connected; discovering GATT services")
         do {
+            try Task.checkCancellation()
             let table = try await discoverGATT(timeout: 10)
             logGATT(table, to: log)
             let candidates = GATTCandidateRanker.candidates(from: table, preferred: preferredLink)
@@ -108,6 +126,27 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
                 self.central.disconnectOnQueue(self.peripheralID)
             }
             throw error
+        }
+    }
+
+    /// Queue-confined. Fails whatever open() step is waiting so cancellation
+    /// (source switch, Disconnect) takes effect immediately.
+    private func abortOpen(generation: Int) {
+        guard generation == self.generation, mode == .opening || mode == .probing else { return }
+        cancelledGeneration = generation
+        if let w = discoveryWaiter {
+            discoveryWaiter = nil
+            w.resume(throwing: CancellationError())
+        }
+        if let w = notifyWaiter {
+            notifyWaiter = nil
+            notifyTarget = nil
+            w.resume(throwing: CancellationError())
+        }
+        if let w = probeWaiter {
+            probeWaiter = nil
+            mode = .opening
+            w.resume(returning: nil)
         }
     }
 
@@ -161,8 +200,12 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
     private func discoverGATT(timeout: TimeInterval) async throws -> [GATTCharacteristicInfo] {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<[GATTCharacteristicInfo], Error>) in
             queue.async {
-                guard let p = self.central.peripheralOnQueue(self.peripheralID) else {
-                    c.resume(throwing: TransportError.peripheralNotFound)
+                if self.cancelledGeneration == self.generation {
+                    c.resume(throwing: CancellationError())
+                    return
+                }
+                guard let p = self.central.peripheralOnQueue(self.peripheralID), p.state == .connected else {
+                    c.resume(throwing: TransportError.disconnected("not connected before GATT discovery"))
                     return
                 }
                 self.peripheral = p
@@ -181,16 +224,26 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
         }
     }
 
-    /// Returns the reply text if the pair answers like an ELM327.
+    /// Returns the reply text if the pair answers like an ELM327. Throws when
+    /// the link is lost or open() is cancelled: those are not "no reply".
     private func probe(_ candidate: GATTLinkCandidate) async throws -> String? {
         do {
             try await setNotify(true, candidate: candidate)
+        } catch let error as TransportError {
+            if case .disconnected = error { throw error }
+            log?.warning("BLE: could not subscribe to \(candidate.notifyUUID): \(error)")
+            return nil
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             log?.warning("BLE: could not subscribe to \(candidate.notifyUUID): \(error)")
             return nil
         }
         let reply = await probeExchange(candidate, timeout: 1.5)
         if reply == nil {
+            try Task.checkCancellation()
+            let stillConnected = await onQueue { self.mode != .closed && self.peripheral?.state == .connected }
+            guard stillConnected else { throw TransportError.disconnected("link lost while probing") }
             try? await setNotify(false, candidate: candidate)
         }
         return reply
@@ -199,8 +252,15 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
     private func setNotify(_ enabled: Bool, candidate: GATTLinkCandidate) async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             queue.async {
-                guard let p = self.peripheral,
-                      let ch = self.characteristics[Self.key(candidate.serviceUUID, candidate.notifyUUID)] else {
+                if self.cancelledGeneration == self.generation {
+                    c.resume(throwing: CancellationError())
+                    return
+                }
+                guard let p = self.peripheral, p.state == .connected, self.mode != .closed else {
+                    c.resume(throwing: TransportError.disconnected("not connected"))
+                    return
+                }
+                guard let ch = self.characteristics[Self.key(candidate.serviceUUID, candidate.notifyUUID)] else {
                     c.resume(throwing: TransportError.noCompatibleCharacteristics)
                     return
                 }
@@ -208,13 +268,16 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
                     c.resume()
                     return
                 }
+                self.notifyRequest += 1
+                let request = self.notifyRequest
                 self.notifyWaiter = c
+                self.notifyTarget = ch
                 p.setNotifyValue(enabled, for: ch)
-                let generation = self.generation
                 self.queue.asyncAfter(deadline: .now() + 3) {
-                    guard generation == self.generation, let waiter = self.notifyWaiter else { return }
+                    guard request == self.notifyRequest, let waiter = self.notifyWaiter else { return }
                     self.notifyWaiter = nil
-                    waiter.resume(throwing: BLEError.timedOut("enabling notifications"))
+                    self.notifyTarget = nil
+                    waiter.resume(throwing: BLEError.timedOut(enabled ? "enabling notifications" : "disabling notifications"))
                 }
             }
         }
@@ -223,7 +286,8 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
     private func probeExchange(_ candidate: GATTLinkCandidate, timeout: TimeInterval) async -> String? {
         await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
             queue.async {
-                guard let p = self.peripheral,
+                guard self.cancelledGeneration != self.generation, self.mode != .closed,
+                      let p = self.peripheral, p.state == .connected,
                       let w = self.characteristics[Self.key(candidate.serviceUUID, candidate.writeUUID)] else {
                     c.resume(returning: nil)
                     return
@@ -232,14 +296,15 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
                 self.probeNotifyKey = Self.key(candidate.serviceUUID, candidate.notifyUUID)
                 self.probeFramer.reset()
                 self.probeWaiter = c
+                self.probeRequest += 1
+                let request = self.probeRequest
                 let type: CBCharacteristicWriteType = candidate.writeType == .withoutResponse ? .withoutResponse : .withResponse
                 p.writeValue(Data("ATI\r".utf8), for: w, type: type)
                 self.log?.record(.tx, "ATI (probe)")
-                let generation = self.generation
                 self.queue.asyncAfter(deadline: .now() + timeout) {
-                    guard generation == self.generation, let waiter = self.probeWaiter else { return }
+                    guard request == self.probeRequest, let waiter = self.probeWaiter else { return }
                     self.probeWaiter = nil
-                    self.mode = .opening
+                    if self.mode == .probing { self.mode = .opening }
                     waiter.resume(returning: nil)
                 }
             }
@@ -368,6 +433,7 @@ final class BLEOBDTransport: NSObject, OBDTransport, BLEConnectionObserver, @unc
         }
         if let waiter = notifyWaiter {
             notifyWaiter = nil
+            notifyTarget = nil
             waiter.resume(throwing: TransportError.disconnected(reason))
         }
         if let waiter = probeWaiter {
@@ -425,8 +491,10 @@ extension BLEOBDTransport: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard let waiter = notifyWaiter else { return }
+        // Only the characteristic this request targets may complete it.
+        guard characteristic === notifyTarget, let waiter = notifyWaiter else { return }
         notifyWaiter = nil
+        notifyTarget = nil
         if let error {
             waiter.resume(throwing: TransportError.connectFailed("Notify: \(error.localizedDescription)"))
         } else {

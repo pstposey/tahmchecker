@@ -18,6 +18,9 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
         /// BLE-like notification size; responses are split into chunks.
         public var chunkSize = 20
         public var version = "v1.5"
+        /// Whether the emulated adapter accepts the trailing response-count
+        /// digit ("010C1"). Real clones may not; set false to test the fallback.
+        public var supportsResponseCountHint = true
         public init() {}
     }
 
@@ -189,7 +192,10 @@ public final class SimulatedELM327Transport: OBDTransport, @unchecked Sendable {
     private func handleOBD(_ command: String, _ s: ELMState) -> [String] {
         // Optional trailing response-count digit.
         var hex = command
-        if hex.count % 2 == 1 { hex.removeLast() }
+        if hex.count % 2 == 1 {
+            guard config.supportsResponseCountHint else { return ["?"] }
+            hex.removeLast()
+        }
         guard let bytes = Hex.bytes(hex), bytes.count >= 2, bytes[0] == 0x01 else {
             return Hex.bytes(hex) == nil ? ["?"] : ["NO DATA"]
         }

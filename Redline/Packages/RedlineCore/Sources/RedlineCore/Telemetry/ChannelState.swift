@@ -93,8 +93,10 @@ public final class ChannelState: Identifiable {
         let stale = now - latest.timing.receivedAt > descriptor.staleAfter
         if stale != isStale { isStale = stale }
         if stale {
-            // The measured rate no longer describes reality.
+            // The measured rate no longer describes reality, and the gap must
+            // not be measured as a sample interval when data resumes.
             intervalEWMA = nil
+            lastReceivedAt = nil
             if observedRateHz != nil { observedRateHz = nil }
         }
     }

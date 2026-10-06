@@ -101,7 +101,15 @@ final class BLECentral: NSObject, @unchecked Sendable {
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var wantsScan = false
     private var stateWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
-    private var connectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    /// One pending connect per peripheral, tagged with its attempt token so a
+    /// timer or cancellation from an earlier attempt can't fail a later one.
+    private var connectWaiters: [UUID: (token: UUID, continuation: CheckedContinuation<Void, Error>)] = [:]
+    /// Attempts cancelled before their queue block ran.
+    private var cancelledConnectTokens: Set<UUID> = []
+    /// Peripherals we asked CoreBluetooth to disconnect whose
+    /// didDisconnectPeripheral has not arrived yet. That callback belongs to
+    /// the old link and must not fail a new connection to the same adapter.
+    private var pendingCancels: Set<UUID> = []
     private var observers: [UUID: BLEConnectionObserver] = [:]
 
     init(model: BluetoothModel) {
@@ -181,33 +189,47 @@ final class BLECentral: NSObject, @unchecked Sendable {
     }
 
     func connect(_ id: UUID, observer: BLEConnectionObserver, timeout: TimeInterval) async throws {
+        let token = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
                 queue.async {
+                    if self.cancelledConnectTokens.remove(token) != nil {
+                        c.resume(throwing: BLEError.cancelled)
+                        return
+                    }
                     guard let central = self.central, let p = self.peripheralOnQueue(id) else {
                         c.resume(throwing: TransportError.peripheralNotFound)
                         return
                     }
                     self.observers[id] = observer
-                    if p.state == .connected {
+                    let cancelInFlight = self.pendingCancels.contains(id)
+                    if p.state == .connected, !cancelInFlight {
                         c.resume()
                         return
                     }
-                    self.connectWaiters.removeValue(forKey: id)?.resume(throwing: BLEError.cancelled)
-                    self.connectWaiters[id] = c
-                    central.connect(p, options: nil)
+                    self.connectWaiters.removeValue(forKey: id)?.continuation.resume(throwing: BLEError.cancelled)
+                    self.connectWaiters[id] = (token, c)
+                    // If our own disconnect is still completing, connect once
+                    // its didDisconnectPeripheral arrives (see that callback).
+                    if !cancelInFlight { central.connect(p, options: nil) }
                     self.queue.asyncAfter(deadline: .now() + timeout) {
-                        guard let waiter = self.connectWaiters.removeValue(forKey: id) else { return }
+                        guard self.connectWaiters[id]?.token == token,
+                              let waiter = self.connectWaiters.removeValue(forKey: id) else { return }
                         if let p = self.peripherals[id] { self.central?.cancelPeripheralConnection(p) }
-                        waiter.resume(throwing: TransportError.connectTimedOut)
+                        waiter.continuation.resume(throwing: TransportError.connectTimedOut)
                     }
                 }
             }
         } onCancel: {
             self.queue.async {
-                guard let waiter = self.connectWaiters.removeValue(forKey: id) else { return }
+                guard self.connectWaiters[id]?.token == token,
+                      let waiter = self.connectWaiters.removeValue(forKey: id) else {
+                    // Not registered yet: make the queue block bail out.
+                    self.cancelledConnectTokens.insert(token)
+                    return
+                }
                 if let p = self.peripherals[id] { self.central?.cancelPeripheralConnection(p) }
-                waiter.resume(throwing: BLEError.cancelled)
+                waiter.continuation.resume(throwing: BLEError.cancelled)
             }
         }
     }
@@ -215,7 +237,11 @@ final class BLECentral: NSObject, @unchecked Sendable {
     /// Must be called on `queue`.
     func disconnectOnQueue(_ id: UUID) {
         observers.removeValue(forKey: id)
-        if let p = peripherals[id] { central?.cancelPeripheralConnection(p) }
+        guard let p = peripherals[id] else { return }
+        if p.state == .connected || p.state == .disconnecting {
+            pendingCancels.insert(id)
+        }
+        central?.cancelPeripheralConnection(p)
     }
 }
 
@@ -232,12 +258,33 @@ extension BLECentral: CBCentralManagerDelegate {
             for (_, waiter) in stateWaiters { waiter.resume() }
             stateWaiters.removeAll()
             beginScanIfPossible()
-        case .unauthorized, .unsupported:
+            return
+        case .unauthorized:
             for (_, waiter) in stateWaiters { waiter.resume(throwing: TransportError.notAuthorized) }
             stateWaiters.removeAll()
-            publishScanning(false)
+        case .unsupported:
+            for (_, waiter) in stateWaiters { waiter.resume(throwing: TransportError.unavailable("Bluetooth LE unsupported")) }
+            stateWaiters.removeAll()
         default:
-            publishScanning(false)
+            break
+        }
+        publishScanning(false)
+
+        // Below poweredOn every connection is gone, and CoreBluetooth does not
+        // promise a didDisconnectPeripheral for each, so report them here.
+        let reason = availability.title
+        let waiters = connectWaiters
+        connectWaiters.removeAll()
+        for (_, w) in waiters { w.continuation.resume(throwing: TransportError.disconnected(reason)) }
+        pendingCancels.removeAll()
+        let currentObservers = observers
+        observers.removeAll()
+        let error = NSError(domain: "Redline.Bluetooth", code: 1, userInfo: [NSLocalizedDescriptionKey: reason])
+        for (_, o) in currentObservers { o.peripheralDidDisconnect(error: error) }
+        // Below poweredOff, every CBPeripheral from this manager is invalid and
+        // must be retrieved again (CoreBluetooth header documentation).
+        if central.state.rawValue < CBManagerState.poweredOff.rawValue {
+            peripherals.removeAll()
         }
     }
 
@@ -258,17 +305,23 @@ extension BLECentral: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        connectWaiters.removeValue(forKey: peripheral.identifier)?.resume()
+        connectWaiters.removeValue(forKey: peripheral.identifier)?.continuation.resume()
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        connectWaiters.removeValue(forKey: peripheral.identifier)?.resume(
+        connectWaiters.removeValue(forKey: peripheral.identifier)?.continuation.resume(
             throwing: TransportError.connectFailed(error?.localizedDescription ?? "unknown error"))
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let id = peripheral.identifier
-        connectWaiters.removeValue(forKey: id)?.resume(
+        if pendingCancels.remove(id) != nil {
+            // Completion of a disconnect we requested for a previous link.
+            // A new connect may be waiting for it.
+            if connectWaiters[id] != nil { central.connect(peripheral, options: nil) }
+            return
+        }
+        connectWaiters.removeValue(forKey: id)?.continuation.resume(
             throwing: TransportError.disconnected(error?.localizedDescription))
         observers[id]?.peripheralDidDisconnect(error: error)
     }

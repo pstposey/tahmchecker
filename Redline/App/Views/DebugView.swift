@@ -96,7 +96,7 @@ struct DebugView: View {
                     }
                     if let support = engine.support {
                         ForEach(support.respondingECUs, id: \.self) { ecu in
-                            LabeledContent("PIDs @ \(ecu)") {
+                            LabeledContent("PIDs @ \(ecu.description)") {
                                 Text((support.byECU[ecu] ?? []).sorted().map(Hex.byteString).joined(separator: " "))
                                     .font(.caption2.monospaced())
                                     .multilineTextAlignment(.trailing)

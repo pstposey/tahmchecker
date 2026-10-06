@@ -294,3 +294,168 @@ struct DebugReportTests {
         await engine.stop()
     }
 }
+
+@Suite("Regression: review findings")
+struct ReviewRegressionTests {
+    func makeSession(_ transport: ScriptedTransport) async throws -> ELM327Session {
+        var timing = ELM327Session.Timing()
+        timing.defaultTimeout = .milliseconds(300)
+        timing.latePromptGrace = .milliseconds(150)
+        timing.resyncTimeout = .milliseconds(300)
+        let session = ELM327Session(transport: transport, log: CommLog(), timing: timing)
+        await session.start(consuming: try await transport.open(log: session.log))
+        return session
+    }
+
+    /// A late answer still arriving when the grace period ends must be waited
+    /// for, not followed by a bare CR whose repeat would shift every response.
+    @Test func noBareCRWhileLateResponseIsInProgress() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "010C": return .silence
+            case "": return .text("41 0C 1A F8\r\r>", after: .milliseconds(60))
+            case "010D": return .text("41 0D 32\r\r>", after: .milliseconds(120))
+            default: return .silence
+            }
+        }
+        let s = try await makeSession(t)
+        let start = ContinuousClock().now
+        Task {
+            try? await ContinuousClock().sleep(until: start + .milliseconds(400))
+            t.send("41 0C 1A")
+            try? await ContinuousClock().sleep(until: start + .milliseconds(475))
+            t.send(" F8\r\r>")
+        }
+        await #expect(throws: ELMSessionError.timedOut(command: "010C")) { try await s.execute("010C") }
+        let ex = try await s.execute("010D")
+        #expect(ex.response.lines == ["41 0D 32"])
+        #expect(t.writtenCommands == ["010C", "010D"]) // no bare CR was needed
+    }
+
+    @Test func cancellationDuringResyncIsReportedAsCancelled() async throws {
+        let t = ScriptedTransport { _ in .silence }
+        let s = try await makeSession(t)
+        await #expect(throws: ELMSessionError.self) { try await s.execute("010C") }
+        let task = Task { try await s.execute("010D") }
+        try await Task.sleep(for: .milliseconds(40))
+        task.cancel()
+        await #expect(throws: ELMSessionError.cancelled) { try await task.value }
+    }
+}
+
+@MainActor
+@Suite("Regression: engine lifecycle")
+struct EngineLifecycleRegressionTests {
+    @Test func startDuringStopDoesNotKillNewConnection() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.autoReconnect = false // a killed connection must not be masked by reconnecting
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { engine.state == .streaming }
+        let stopping = Task { await engine.stop() }
+        await Task.yield()
+        engine.start(transport: SimulatedELM327Transport())
+        await stopping.value
+        #expect(engine.state != .idle) // stop() must not report idle over the new connection
+        try await waitUntil(seconds: 15) { engine.state == .streaming }
+        let rpm = engine.store.channel(.engineRPM)!
+        let before = rpm.sampleCount
+        try await Task.sleep(for: .seconds(1))
+        #expect(engine.state == .streaming) // not idle / reconnecting
+        #expect(rpm.sampleCount > before)
+        await engine.stop()
+        #expect(engine.state == .idle)
+    }
+
+    @Test func orderlyStopIsNotLoggedAsDisconnect() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { engine.state == .streaming }
+        await engine.stop()
+        #expect(!engine.log.exportText().contains("event stream ended"))
+        #expect(engine.adapterInfo == nil)
+        #expect(engine.support == nil)
+        #expect(engine.linkDetails == nil)
+        #expect(engine.polledChannels.isEmpty)
+    }
+
+    @Test func metadataFromPreviousSourceIsCleared() async throws {
+        final class FailingTransport: OBDTransport, @unchecked Sendable {
+            let identity = TransportIdentity(kind: .bluetoothLE, name: "Failing BLE", identifier: "x")
+            func open(log: CommLog) async throws -> AsyncStream<TransportEvent> { throw TransportError.connectTimedOut }
+            func write(_ data: Data) async throws { throw TransportError.notOpen }
+            func close() async {}
+            func linkDetails() async -> TransportLinkDetails { TransportLinkDetails() }
+        }
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.autoReconnect = false
+        engine.start(transport: SimulatedELM327Transport())
+        try await waitUntil(seconds: 15) { engine.state == .streaming }
+        engine.start(transport: FailingTransport())
+        try await waitUntil(seconds: 10) { if case .disconnected = engine.state { return true } else { return false } }
+        #expect(engine.adapterInfo == nil)
+        #expect(engine.linkDetails == nil)
+        #expect(engine.support == nil)
+        #expect(!engine.debugReport(appVersion: "t").contains("Simulated ELM327"))
+        await engine.stop()
+    }
+
+    @Test func reconnectBackoffResetsAfterSuccessfulSession() async throws {
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        let sim = SimulatedELM327Transport()
+        engine.start(transport: sim)
+        var attempts: [Int] = []
+        for _ in 0..<2 {
+            try await waitUntil(seconds: 15) { engine.state == .streaming }
+            await sim.close() // link drops
+            try await waitUntil(seconds: 5) {
+                if case .reconnecting = engine.state { return true } else { return false }
+            }
+            if case .reconnecting(let n) = engine.state { attempts.append(n) }
+        }
+        #expect(attempts == [1, 1])
+        await engine.stop()
+    }
+
+    @Test func rejectedResponseCountHintIsReflectedInEffectiveOptions() async throws {
+        var config = SimulatedELM327Transport.Configuration()
+        config.supportsResponseCountHint = false
+        let engine = TelemetryEngine(options: ELMOptions(responseCountHint: true), pollingPreset: .rpmOnly)
+        engine.start(transport: SimulatedELM327Transport(configuration: config))
+        try await waitUntil(seconds: 15) { (engine.store.channel(.engineRPM)?.sampleCount ?? 0) > 3 }
+        #expect(engine.effectiveOptions?.responseCountHint == false)
+        await engine.stop()
+    }
+}
+
+@MainActor
+@Suite("Regression: store accuracy")
+struct StoreAccuracyRegressionTests {
+    func sample(_ id: ChannelID, _ value: Double, at t: MonotonicInstant) -> TelemetrySample {
+        TelemetrySample(channel: id, value: value, source: .ecuReported,
+                        timing: SampleTiming(requestedAt: t, receivedAt: t, decodedAt: t))
+    }
+
+    @Test func cachedBaroIsNotUsedOnceUnsupported() {
+        let store = TelemetryStore()
+        let t = ContinuousClock().now
+        store.apply([.support(.manifoldPressure, .supported), .support(.barometricPressure, .supported),
+                     .sample(sample(.barometricPressure, 83, at: t)), .sample(sample(.manifoldPressure, 100, at: t))])
+        #expect(store.channel(.boost)?.latest?.value == 17)
+        // Re-discovery on a new link: BARO not reported.
+        store.apply([.support(.barometricPressure, .unsupported),
+                     .sample(sample(.manifoldPressure, 150, at: t + .seconds(60)))])
+        let boost = store.channel(.boost)!
+        #expect(boost.latest?.value == 17) // no new boost from the stale BARO
+        if case .unavailable = boost.support {} else { Issue.record("boost should be unavailable, is \(boost.support)") }
+    }
+
+    @Test func rateAfterStaleGapMeasuresRealSamplesOnly() {
+        let store = TelemetryStore()
+        let t = ContinuousClock().now
+        for i in 0..<10 { store.apply([.sample(sample(.engineRPM, 750, at: t + .milliseconds(100 * i)))]) }
+        store.sweepStaleness(now: t + .seconds(5))
+        for i in 0..<3 { store.apply([.sample(sample(.engineRPM, 750, at: t + .seconds(6) + .milliseconds(100 * i)))]) }
+        let hz = store.channel(.engineRPM)!.observedRateHz!
+        #expect(abs(hz - 10) < 0.01)
+    }
+}

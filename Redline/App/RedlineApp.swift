@@ -31,8 +31,8 @@ struct RootView: View {
                 .tabItem { Label("Debug", systemImage: "ladybug") }
         }
         .tint(Theme.redline)
-        .onChange(of: model.engine.state.isStreaming, initial: true) { _, streaming in
-            UIApplication.shared.isIdleTimerDisabled = streaming && model.settings.keepScreenAwake
+        .onChange(of: model.engine.state.isStreaming && model.settings.keepScreenAwake, initial: true) { _, keepAwake in
+            UIApplication.shared.isIdleTimerDisabled = keepAwake
         }
     }
 }

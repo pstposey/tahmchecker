@@ -25,6 +25,9 @@ public actor PollingWorker {
 
     private let session: ELM327Session
     private let monitor: PerformanceMonitor
+    /// Reports automatic option fallbacks (e.g. the adapter rejected the
+    /// response-count hint) so the engine's effective options stay truthful.
+    private let onOptionsChanged: (@Sendable (ELMOptions) -> Void)?
     private var context: Context
     private var scheduler = PollScheduler()
     private var definitions: [PIDKey: PIDDefinition] = [:]
@@ -38,10 +41,12 @@ public actor PollingWorker {
     private let vehicleLossQuietPeriod: Duration = .seconds(3)
     private let adapterLossTimeouts = 4
 
-    public init(session: ELM327Session, monitor: PerformanceMonitor, context: Context) {
+    public init(session: ELM327Session, monitor: PerformanceMonitor, context: Context,
+                onOptionsChanged: (@Sendable (ELMOptions) -> Void)? = nil) {
         self.session = session
         self.monitor = monitor
         self.context = context
+        self.onOptionsChanged = onOptionsChanged
     }
 
     /// Sets which PIDs are polled. Returns the channels actually polled
@@ -138,6 +143,7 @@ public actor PollingWorker {
                 case .message(let message):
                     if message == .unknownCommand, context.options.responseCountHint, command != key.requestCommand {
                         context.options.responseCountHint = false
+                        onOptionsChanged?(context.options)
                         session.log.warning("Adapter rejected response-count suffix (\(command)); disabled for this session")
                         scheduler.markResult(key, success: true, at: decodedAt) // not the PID's fault
                         continue

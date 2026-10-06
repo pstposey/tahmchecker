@@ -117,6 +117,8 @@ public actor ELM327Session {
                 guard let self else { return }
                 await self.handle(event)
             }
+            // When close() cancelled us it reports the orderly close itself.
+            guard !Task.isCancelled else { return }
             await self?.markClosed(.disconnected("event stream ended"))
         }
     }
@@ -303,6 +305,18 @@ public actor ELM327Session {
             needsResync = false
             return
         }
+        if Task.isCancelled { throw ELMSessionError.cancelled }
+        // Part of the late answer has arrived: the adapter is still printing,
+        // not stuck. A CR now could reach it after its prompt, making an idle
+        // ELM327 repeat the command and shifting every later response by one.
+        if framer.hasPartialResponse {
+            log.warning("Resynchronizing: late response in progress, waiting for it to finish")
+            if await waitForPrompt(timing.resyncTimeout) {
+                needsResync = false
+                return
+            }
+            if Task.isCancelled { throw ELMSessionError.cancelled }
+        }
         guard lastCommandRepeatSafe else {
             log.error("Refusing bare-CR resync: last command \(lastCommand) is not repeat-safe")
             throw ELMSessionError.resyncRefused(lastCommand: lastCommand)
@@ -315,9 +329,14 @@ public actor ELM327Session {
             throw ELMSessionError.transport((error as? TransportError) ?? .writeFailed(String(describing: error)))
         }
         if await waitForPrompt(timing.resyncTimeout) {
+            // If the late prompt and the CR's own reply crossed, a second
+            // prompt follows; absorb it so it can't complete the next command.
+            _ = await waitForPrompt(timing.latePromptGrace)
+            if Task.isCancelled { throw ELMSessionError.cancelled }
             needsResync = false
             return
         }
+        if Task.isCancelled { throw ELMSessionError.cancelled }
         log.error("Adapter did not return a prompt after resync")
         throw ELMSessionError.adapterUnresponsive
     }
