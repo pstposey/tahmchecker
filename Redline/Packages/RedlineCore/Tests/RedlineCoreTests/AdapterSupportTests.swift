@@ -163,18 +163,68 @@ struct AdapterEngineTests {
         await engine.stop()
     }
 
+    /// Review finding: the counter used to survive stop()/start(), so a
+    /// fresh connection could begin at the 30 s retry interval.
+    @Test func vehicleRetryBackoffRestartsForEachConnection() async throws {
+        let ignitionOff: (String) -> ScriptedTransport.Reply = { cmd in
+            switch cmd {
+            case "ATZ": return .text("\r\rELM327 v1.5\r\r>", after: .milliseconds(2))
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(2))
+            case "AT@1": return .text("OBDII to RS232 Interpreter\r\r>", after: .milliseconds(2))
+            case "ATRV": return .text("12.6V\r\r>", after: .milliseconds(2))
+            case "ATDPN": return .text("0\r\r>", after: .milliseconds(2))
+            case "0100": return .text("NO DATA\r\r>", after: .milliseconds(2))
+            default: return .text("OK\r\r>", after: .milliseconds(2))
+            }
+        }
+        let engine = TelemetryEngine(pollingPreset: .rpmOnly)
+        engine.start(transport: ScriptedTransport(script: ignitionOff))
+        try await waitUntil(seconds: 10) { engine.unansweredVehicleProbes >= 1 }
+        engine.unansweredVehicleProbes = 20 // as if the ignition had been off for minutes
+        await engine.stop()
+        #expect(engine.state == .idle)
+        engine.start(transport: ScriptedTransport(script: ignitionOff))
+        try await waitUntil(seconds: 10) {
+            if case .vehicleUnavailable = engine.state { return true }
+            return false
+        }
+        #expect(engine.unansweredVehicleProbes == 1)
+        if case .vehicleUnavailable(let why) = engine.state {
+            #expect(why.contains("Retrying in 3 s"), "\(why)")
+        } else {
+            Issue.record("expected vehicleUnavailable, got \(engine.state)")
+        }
+        await engine.stop()
+    }
+
     @Test func vehicleRetriesSlowDownWhileTheVehicleStaysSilent() {
         #expect((1...5).map { TelemetryEngine.vehicleRetryDelay($0) }.allSatisfy { $0 == .seconds(3) })
         #expect(TelemetryEngine.vehicleRetryDelay(6) == .seconds(10))
         #expect(TelemetryEngine.vehicleRetryDelay(100) == .seconds(30))
     }
 
+    /// The poller's own guard: even when an ECU supports PID 04 and the
+    /// caller asks for it, `0104` is never scheduled (the session would
+    /// refuse it, and a refused poll must not tear the link down).
+    @Test func pollerNeverSchedulesAPolicyRefusedPID() async throws {
+        let session = ELM327Session(transport: SimulatedELM327Transport(), log: CommLog())
+        var support = PIDSupportMap()
+        support.record(base: 0x00, bitmask: [0x18, 0x18, 0x00, 0x00], from: .can11(0x7E8)) // PIDs 04, 05, 0C, 0D
+        let worker = PollingWorker(session: session, monitor: PerformanceMonitor(),
+                                   context: .init(info: AdapterInfo(), support: support, options: ELMOptions()))
+        let load = try #require(StandardPIDs.definition(for: .engineLoad))
+        let rpm = try #require(StandardPIDs.definition(for: .engineRPM))
+        #expect(support.isSupported(0x04) && support.isSupported(0x0C))
+        #expect(await worker.setPolled([load, rpm]) == [.engineRPM])
+        #expect(await !worker.isPollable(load))
+    }
+
     @Test func policyBlockedPIDIsReportedNotPolled() async throws {
         let engine = TelemetryEngine(pollingPreset: .turboDashboard)
         engine.start(transport: SimulatedELM327Transport())
         try await waitUntil(seconds: 15) { engine.state == .streaming }
-        #expect(!engine.polledChannels.contains(.engineLoad))
-        // The simulated ECU supports PID 04; Redline must still not request it.
+        // The simulated ECU supports PID 04; Redline must still not request it,
+        // and the channel says why.
         if case .unavailable(let why)? = engine.store.channel(.engineLoad)?.support {
             #expect(why.contains("read-only policy"))
         } else {

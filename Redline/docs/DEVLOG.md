@@ -47,3 +47,45 @@ Every outbound path was traced to its sink: two `transport.write` calls in the s
 - **Bare-CR resync.** The ELM327 repeats its last command on a bare CR. Before, that last command could be another app's (e.g. clear codes), or Redline's own `ATSP0`. The CR now requires an answered command from this session **and** that the last command is a read (an OBD read or an informational AT query). The old rule sent `ATE0, ATSP0, CR, ATRV` after a lost `ATSP0` prompt; the regression test shows it now stops at `ATSP0`.
 - **BLE writes to unknown characteristics.** The `ATI` probe and CCCD writes are now limited to recognized ELM327 bridge layouts. An unknown layout fails with nothing written.
 - **Tests that hold the boundary:** exhaustive 256-service check, dangerous AT commands, injection look-alikes, an end-to-end capture of everything the emulated adapter receives, and a source scan pinning every outbound call site. A new write path fails CI until it is reviewed. **Tests:** 98.
+
+## 2026-10-06/07: OBDLink MX+ support (before any hardware test)
+
+The owner switched the primary adapter to an OBDLink MX+ (the Vgate stays supported).
+
+**Research** (MXPLUS.md has the details and sources):
+- The MX+ is Bluetooth Classic v3.0. OBDLink says the CX is its only BLE adapter.
+- iOS reaches it only through Apple's MFi **External Accessory** framework (`EASession` byte streams), never CoreBluetooth. iOS pairs and connects it after you press its Connect button in Settings › Bluetooth; apps can only open a session to an accessory iOS has already connected.
+- Its MFi protocol string is not published. Redline declares two community-sourced candidates (`com.obdlink`, `com.scantool.stnobd`), both UNVERIFIED.
+- Without the external-accessory background mode, sessions end when the app goes to the background.
+- Some research angles (STN command behaviour, prior-art code) didn't complete because of the usage limit. Those items are marked UNVERIFIED rather than guessed.
+
+**Design.**
+- Both adapters are `OBDTransport`s, and nothing above the transport changed for the MX+.
+- The stream logic is in core and unit-tested with mock streams: `AccessoryStreamTransport` for the open/close/cancel/disconnect lifecycle, `StreamPump` for Apple DTS's non-blocking stream pattern, and `StreamWriteBuffer` for partial writes.
+- The iOS layer is thin. `ExternalAccessoryCenter` is `@MainActor` and handles discovery and notifications. `EAStreamSession` owns one run-loop thread per session and tears down in the reverse order of setup.
+- Connect screen: separate MX+ and BLE sections.
+- Debug report adds: transport type, name-based adapter identification with evidence, per-command initialization results with timings, the connection-state history, and the iOS version and device model.
+
+**Read-only hardening.** The independent auditor from the previous round found that an ELM327 discards the character that interrupts or wakes it and may act on the rest of the line. For example, `0104` could leave `04` (clear codes), and `01101` could leave `1101` (ECU reset).
+- The session no longer sends a bare CR. On uncertain state it probes with `ATI` (whose truncations aren't commands) before writing anything.
+- The policy refuses any line whose truncation would be a clear or a parameterized non-read request. As a result, PID 04 and the response-count hint are gone, and the turbo dashboard uses absolute load instead.
+- Raw input must be plain ASCII before normalization.
+- `ATSP0` is skipped when `ATDPN` is unreadable.
+- Retries while the vehicle is silent back off to 30 s.
+
+**Adversarial review** (5 angles, each finding independently verified; 3 verifiers hit the usage limit, so those findings were checked by hand):
+- **Medium:** with replies slower than the probe timeout, a late probe answer could pass as the newest probe's. The adapter would then be declared idle with one reply outstanding, and every later reply would be shifted by one. This was not a read-only break.
+  - Fixed: one probe outstanding at a time, a probe reply must match the adapter's own `ATI` text, a silence window longer than the gaps between writes, and an unanswered-write count.
+  - Three regression tests fail on the old code.
+- **Low:**
+  - Inventory regexes missed `pump?.send(` and nested-paren writes.
+  - The vehicle-retry backoff survived a new connection.
+  - Three tests were vacuous or racy: the poller's policy guard is now tested directly, the hint test checks what is actually sent, and a zero-margin timing race is fixed.
+  - The BLE status read "Checking Bluetooth…" until a scan.
+  - The foreground resume reopened the remembered adapter instead of the active MFi link.
+  - An immediate reconnect could be refused while our own previous `EASession` was still being released; now Redline retries briefly.
+  - All fixed.
+
+**CI lesson:** a race in the end-to-end capture test (a poll from the previous preset still in flight) failed on the macOS runner only. It is fixed, and the suite was re-run 3× with all CPUs saturated.
+
+**Tests:** 144, on Linux and macOS. The iOS app builds with `xcodebuild` (generic iOS device, unsigned) with no Swift warnings. Mocks are not hardware: everything MX+-specific listed in MXPLUS.md and HARDWARE_TEST.md still needs the physical adapter.

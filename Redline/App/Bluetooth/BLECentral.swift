@@ -5,6 +5,9 @@ import RedlineCore
 
 /// Bluetooth radio availability as shown to the user.
 enum BluetoothAvailability: Equatable, Sendable {
+    /// Bluetooth LE not started yet (it starts on the first scan, so the
+    /// MX+ and simulator paths never trigger the permission prompt).
+    case notStarted
     case unknown
     case resetting
     case unsupported
@@ -14,6 +17,7 @@ enum BluetoothAvailability: Equatable, Sendable {
 
     var title: String {
         switch self {
+        case .notStarted: return "Tap Scan to use Bluetooth LE"
         case .unknown: return "Checking Bluetooth…"
         case .resetting: return "Bluetooth resetting"
         case .unsupported: return "Bluetooth LE unsupported on this device"
@@ -57,7 +61,7 @@ struct DiscoveredAdapter: Identifiable, Equatable, Sendable {
 @MainActor
 @Observable
 final class BluetoothModel {
-    var availability: BluetoothAvailability = .unknown
+    var availability: BluetoothAvailability = .notStarted
     var isScanning = false
     var discovered: [DiscoveredAdapter] = []
 

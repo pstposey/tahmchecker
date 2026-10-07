@@ -51,7 +51,11 @@ Not sent, on purpose: `ATAT` (adaptive timing; the default is assumed to be on, 
 
 - One command in flight at a time (FIFO gate). The poller and the console share it safely.
 - **Timeout:** the session marks itself out of sync. Before the next command it waits 400 ms for the late prompt and *discards* that response, and waits longer while a late response is visibly still arriving.
-- **Unknown state:** if no prompt arrives, the adapter may still be busy, or its prompt was lost. A command written now could reach a busy adapter, which discards the interrupting character and might act on the rest of the line. So the session sends the probe `ATI`, whose truncations (`TI`, `I`) are not commands, until it gets a clean identification reply followed by 400 ms of silence. Only then does the real command go out. After 4 unclear probes → adapter unresponsive → reconnect from `ATZ`.
+- **Unknown state:** the session counts lines written whose prompt hasn't arrived. Once every one is answered, the adapter is idle. Otherwise it may still be busy, or a prompt was lost, and a command written now could reach a busy adapter (which discards the interrupting character and might act on the rest of the line). So the session probes with `ATI`, whose truncations (`TI`, `I`) are not commands:
+  - It keeps only one probe outstanding at a time. Replies that can't be the probe's answer are skipped while it waits for the real one.
+  - It accepts only a reply matching the adapter's own `ATI` text seen earlier.
+  - It then requires silence for longer than the largest gap between this episode's writes, so a late answer can't shift later replies by one.
+  - Only then does the real command go out. After 4 unclear probes → adapter unresponsive → reconnect from `ATZ`.
 - **No bare CR:** a bare CR is never sent, because an idle ELM327 repeats its last command on one.
 - **Cancellation and failed writes** also mark the session out of sync. The adapter will still answer an abandoned command, and part of a failed line may sit in its buffer.
 - **Vehicle silent** (`0100` unanswered): retried after 3 s for the first five attempts, then every 10 s, then every 30 s, to limit protocol-search traffic with the ignition off. Returning to the foreground retries immediately.

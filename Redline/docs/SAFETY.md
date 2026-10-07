@@ -117,7 +117,8 @@ For the Vgate, unrecognized vendor characteristics, which could be configuration
    - An exhaustive test checks every allowed service/PID line.
 4. **The session never writes to an adapter that might be busy.**
    - After a timeout, cancellation or failed write, the session waits for the late prompt.
-   - If the state is still unknown, it sends the probe `ATI`. Its truncations, `TI` and `I`, are not commands, and any partial line left in the adapter plus `ATI` isn't hex either. It sends the next real command only after a clean `ATI` reply followed by silence.
+   - If the state is still unknown, it sends the probe `ATI`. Its truncations, `TI` and `I`, are not commands, and any partial line left in the adapter plus `ATI` isn't hex either.
+   - It sends the next real command only after the probe's own answer (one probe at a time, matching the adapter's `ATI` text) followed by silence longer than the gaps between this episode's writes.
    - **A bare CR is never sent**, because an idle ELM327 repeats its last command on one, and that command could be another app's.
 5. **Stricter console.** The console adds its own allowlist: informational AT commands only, plus the read services.
 6. **BLE write gating** as described in §2c. **The MX+ transport adds no command source**: `StreamPump` writes only what `send` was given.
@@ -138,6 +139,7 @@ For the Vgate, unrecognized vendor characteristics, which could be configuration
   - `strayPromptAfterProbeTriggersAnotherProbe` (the audit's crossed-prompt race)
   - `unclearProbeRepliesAreRetried`
   - `failedWriteForcesAProbeBeforeTheNextCommand`
+  - `slowRepliesNeverShiftResponsesByOne`, `lateAnswerInProbeSlotIsSkippedNotTrusted`, `probeReplyMustMatchTheAdaptersIdentification` (review findings)
 - **End to end:**
   - `everythingTheAdapterReceivesIsAllowed`: the real engine with all presets, both options and hostile console input.
   - `engineStreamsAndEveryTransmittedCommandIsAllowed`: the same check over the MX+ stream transport, with forced partial writes.

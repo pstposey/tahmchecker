@@ -33,9 +33,12 @@ final class AppModel {
     @ObservationIgnored private var bleCentral: BLECentral?
     @ObservationIgnored private var accessoryCenter: ExternalAccessoryCenter?
     @ObservationIgnored private var launched = false
-    /// The MFi session was closed because the app went to the background;
-    /// reconnect when it returns.
-    @ObservationIgnored private var resumeOnForeground = false
+    /// The MFi accessory being used now (nil for BLE / simulator / idle).
+    @ObservationIgnored private var activeAccessory: RememberedAccessory?
+    /// The MFi session closed because the app went to the background; this
+    /// accessory is reopened when the app returns (even if it was forgotten
+    /// in the meantime — the user didn't disconnect it).
+    @ObservationIgnored private var resumeAccessory: RememberedAccessory?
 
     var isSimulationActive: Bool { simulatedVehicle != nil }
 
@@ -77,6 +80,8 @@ final class AppModel {
     // MARK: Sources
 
     func startSimulation() {
+        activeAccessory = nil
+        resumeAccessory = nil
         settings.dataSource = .simulation
         let vehicle = SimulatedVehicle(scenario: settings.simulationScenario)
         simulatedVehicle = vehicle
@@ -122,7 +127,8 @@ final class AppModel {
 
     func disconnect() {
         simulatedVehicle = nil
-        resumeOnForeground = false
+        activeAccessory = nil
+        resumeAccessory = nil
         Task { await engine.stop() }
     }
 
@@ -162,6 +168,8 @@ final class AppModel {
 
     private func startBLE(central: BLECentral, id: UUID, name: String, link: GATTLinkCandidate?) {
         simulatedVehicle = nil
+        activeAccessory = nil
+        resumeAccessory = nil
         let transport = BLEOBDTransport(
             central: central, peripheralID: id, name: name, preferredLink: link,
             onLinkVerified: { [weak self] link in
@@ -179,6 +187,8 @@ final class AppModel {
 
     private func startAccessory(_ accessory: RememberedAccessory) {
         simulatedVehicle = nil
+        activeAccessory = accessory
+        resumeAccessory = nil
         let connector = ExternalAccessoryConnector(center: ensureAccessoryCenter(), target: .remembered(accessory))
         let identity = TransportIdentity(
             kind: .externalAccessory,
@@ -199,18 +209,18 @@ final class AppModel {
             // Accessory notifications are queued and coalesced while the app
             // is suspended: re-read the list instead of trusting them.
             accessoryCenter?.refresh()
-            if resumeOnForeground {
-                resumeOnForeground = false
-                connectRememberedAdapter()
+            if let accessory = resumeAccessory {
+                settings.dataSource = .vehicle
+                startAccessory(accessory)
             } else {
                 engine.retryNow()
             }
         case .background:
-            if engine.transportIdentity?.kind == .externalAccessory, engine.state != .idle, !engine.isStopping {
+            if let accessory = activeAccessory, engine.state != .idle, !engine.isStopping {
                 // Without the external-accessory background mode, iOS ends
                 // accessory sessions when the app is backgrounded. Close ours
                 // cleanly now and open a fresh one on return.
-                resumeOnForeground = true
+                resumeAccessory = accessory
                 Task { await engine.stop() }
             } else {
                 // BLE: without a Bluetooth background mode iOS suspends the

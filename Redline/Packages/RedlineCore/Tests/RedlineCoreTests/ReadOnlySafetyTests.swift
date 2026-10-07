@@ -381,6 +381,12 @@ struct OutboundSurfaceInventoryTests {
         return result
     }
 
+    static func withoutComments(_ text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+
     static func count(_ pattern: String, in text: String) -> Int {
         let regex = try! NSRegularExpression(pattern: pattern)
         return regex.numberOfMatches(in: text, range: NSRange(text.startIndex..., in: text))
@@ -412,9 +418,16 @@ struct OutboundSurfaceInventoryTests {
         // Stream writes (External Accessory / MX+): only the pump writes to
         // an OutputStream, only the stream transport feeds the pump, and
         // only one place opens an EASession.
-        #expect(Self.sites(#"\.write\([^)]*maxLength:"#, in: sources) == ["StreamPump.swift": 1], "\(message)")
-        #expect(Self.sites(#"pump\.send\("#, in: sources) == ["AccessoryStreamTransport.swift": 1], "\(message)")
+        #expect(Self.sites(#"\.write\((?:[^()]|\([^()]*\))*maxLength:"#, in: sources) == ["StreamPump.swift": 1], "\(message)")
+        #expect(Self.sites(#"pump\??\.(send|enqueue)\("#, in: sources) == ["AccessoryStreamTransport.swift": 1], "\(message)")
         #expect(Self.sites(#"EASession\("#, in: sources) == ["ExternalAccessoryCenter.swift": 1], "\(message)")
+        // Only the EA session touches an accessory's output stream, and only
+        // the stream transport and the EA session use the pump (code only,
+        // comments excluded).
+        let code = sources.map { Source(path: $0.path, text: Self.withoutComments($0.text)) }
+        #expect(Self.sites(#"\.outputStream\b"#, in: code).keys.sorted() == ["EAStreamSession.swift"], "\(message)")
+        #expect(Self.sites(#"\bStreamPump\b"#, in: code).keys.sorted()
+                == ["AccessoryStreamTransport.swift", "EAStreamSession.swift", "StreamPump.swift"], "\(message)")
         // Every command goes through ELM327Session.execute (which enforces the policy).
         #expect(Self.sites(#"\.execute\("#, in: sources) == [
             "ELMInitializer.swift": 1, "PollingWorker.swift": 1, "TelemetryEngine.swift": 1,

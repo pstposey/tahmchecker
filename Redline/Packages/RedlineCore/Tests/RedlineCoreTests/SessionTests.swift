@@ -107,11 +107,13 @@ struct SessionTests {
     }
 
     @Test func lateResponseIsDiscardedNotMisattributed() async throws {
-        // 0105's answer arrives after its timeout; the next command must get
+        // 0105's answer arrives after its timeout (250 ms) but well inside
+        // the late-prompt grace (until ~400 ms); the next command must get
         // its own answer, not the late one.
         let t = ScriptedTransport { cmd in
             switch cmd {
-            case "0105": return .text("41 05 82\r\r>", after: .milliseconds(400))
+            case "0105": return .text("41 05 82\r\r>", after: .milliseconds(320))
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(10))
             default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(10))
             }
         }
@@ -170,6 +172,73 @@ struct SessionTests {
         let ex = try await s.execute("010C")
         #expect(ex.response.lines == ["41 0C 1A F8"]) // never the late 0105 answer
         #expect(t.writtenCommands == ["0105", "ATI", "ATI", "010C"])
+    }
+
+    /// Review finding: with replies slower than the probe timeout, a late
+    /// answer to an earlier probe must not pass as the newest probe's, or
+    /// every later command gets the previous command's reply. The session
+    /// must either resynchronize correctly or give up — never misattribute.
+    @Test func slowRepliesNeverShiftResponsesByOne() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .silence
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(350))
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(350))
+            }
+        }
+        let s = try await makeSession(t) // timeout 300 ms, grace 150 ms, resync 300 ms
+        await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
+        do {
+            let ex = try await s.execute("010C", timeout: .seconds(2))
+            #expect(ex.response.lines == ["41 0C 1A F8"], "got \(ex.response.lines)")
+        } catch ELMSessionError.adapterUnresponsive {
+            // Acceptable: a link this slow is reported, not misread.
+        }
+    }
+
+    /// Review finding (in-order adapter): 0105's late answer lands in the
+    /// probe's slot, then the probe's own answer arrives. The session must
+    /// wait for the probe's answer and then write 010C, which gets its own.
+    @Test func lateAnswerInProbeSlotIsSkippedNotTrusted() async throws {
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "0105": return .text("41 05 82\r\r>", after: .milliseconds(480))
+            case "ATI": return .text("ELM327 v1.5\r\r>", after: .milliseconds(150))
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(150))
+            }
+        }
+        var timing = ELM327Session.Timing()
+        timing.defaultTimeout = .milliseconds(250)
+        timing.latePromptGrace = .milliseconds(100)
+        timing.resyncTimeout = .milliseconds(375)
+        let s = ELM327Session(transport: t, log: CommLog(), timing: timing)
+        await s.start(consuming: try await t.open(log: s.log))
+        await #expect(throws: ELMSessionError.timedOut(command: "0105")) { try await s.execute("0105") }
+        let ex = try await s.execute("010C")
+        #expect(ex.response.lines == ["41 0C 1A F8"])
+        let next = try await s.execute("010D")
+        #expect(next.response.lines == ["41 0C 1A F8"]) // its own (scripted) answer, not 010C's
+        #expect(t.writtenCommands == ["0105", "ATI", "010C", "010D"])
+    }
+
+    /// A probe reply must match the adapter's own ATI text: a late "12.6V"
+    /// (another command's answer) is plain text too, but isn't accepted.
+    @Test func probeReplyMustMatchTheAdaptersIdentification() async throws {
+        let probes = Locked(0)
+        let t = ScriptedTransport { cmd in
+            switch cmd {
+            case "ATI":
+                let n = probes.withLock { n -> Int in n += 1; return n }
+                return n == 2 ? .text("12.6V\r\r>", after: .milliseconds(5)) : .text("ELM327 v1.5\r\r>", after: .milliseconds(5))
+            case "0105": return .silence
+            default: return .text("41 0C 1A F8\r\r>", after: .milliseconds(5))
+            }
+        }
+        let s = try await makeSession(t)
+        _ = try await s.execute("ATI") // learns the identification text
+        await #expect(throws: ELMSessionError.self) { try await s.execute("0105") }
+        _ = try await s.execute("010C")
+        #expect(t.writtenCommands == ["ATI", "0105", "ATI", "ATI", "010C"])
     }
 
     /// Replies that show the adapter was interrupted or confused ("STOPPED",
@@ -510,13 +579,16 @@ struct EngineLifecycleRegressionTests {
         await engine.stop()
     }
 
-    @Test func rejectedResponseCountHintIsReflectedInEffectiveOptions() async throws {
-        var config = SimulatedELM327Transport.Configuration()
-        config.supportsResponseCountHint = false
-        let engine = TelemetryEngine(options: ELMOptions(responseCountHint: true), pollingPreset: .rpmOnly)
-        engine.start(transport: SimulatedELM327Transport(configuration: config))
+    /// The response-count hint is refused by the read-only policy (a
+    /// truncated 010C1 is 10C1), even with an adapter that would accept it:
+    /// effective options say so and no hinted request ever reaches it.
+    @Test func responseCountHintIsDisabledByReadOnlyPolicy() async throws {
+        let sim = SimulatedELM327Transport() // supportsResponseCountHint = true
+        let engine = TelemetryEngine(options: ELMOptions(responseCountHint: true), pollingPreset: .rpmAndBoost)
+        engine.start(transport: sim)
         try await waitUntil(seconds: 15) { (engine.store.channel(.engineRPM)?.sampleCount ?? 0) > 3 }
         #expect(engine.effectiveOptions?.responseCountHint == false)
+        #expect(!sim.commandsReceived.contains { $0.hasPrefix("01") && $0.count % 2 == 1 }, "\(sim.commandsReceived)")
         await engine.stop()
     }
 }

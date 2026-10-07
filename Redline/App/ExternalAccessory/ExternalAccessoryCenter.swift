@@ -100,7 +100,7 @@ final class ExternalAccessoryCenter {
             case .success(let choice):
                 if let accessory = accessories.first(where: { $0.connectionID == choice.accessory.connectionID }) {
                     log.info("MFi: opening a session to \(choice.accessory.displayName) with protocol \(choice.protocolString)")
-                    guard let session = EASession(accessory: accessory, forProtocol: choice.protocolString) else {
+                    guard let session = try await makeSession(accessory, choice.protocolString, log: log) else {
                         throw TransportError.connectFailed(
                             "iOS refused a session with \(choice.accessory.displayName) (\(choice.protocolString)). "
                             + "Close other OBD apps (e.g. OBDLink) that may be using the adapter, then try again")
@@ -127,6 +127,22 @@ final class ExternalAccessoryCenter {
             }
             await waitForChange(until: deadline)
         }
+    }
+
+    /// Opens the `EASession`. Only one session per accessory and protocol can
+    /// exist; our previous one (e.g. just closed for a reconnect) is released
+    /// on its stream thread a moment after `close()`, so while one of ours
+    /// is still alive for this accessory, wait briefly and retry instead of
+    /// blaming another app.
+    private func makeSession(_ accessory: EAAccessory, _ protocolString: String, log: CommLog) async throws -> EASession? {
+        for attempt in 0..<20 {
+            if let session = EASession(accessory: accessory, forProtocol: protocolString) { return session }
+            liveSessions.removeAll { $0.session == nil }
+            guard liveSessions.contains(where: { $0.session?.connectionID == accessory.connectionID }) else { return nil }
+            if attempt == 0 { log.info("MFi: previous session still closing; retrying") }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return nil
     }
 
     /// Returns on the next connect/disconnect notification, at `deadline`,

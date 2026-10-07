@@ -92,7 +92,7 @@ public final class TelemetryEngine {
     @ObservationIgnored private var reachedStreaming = false
     @ObservationIgnored private var retryRequested = false
     /// Consecutive `0100` probes the vehicle did not answer.
-    @ObservationIgnored private var unansweredVehicleProbes = 0
+    @ObservationIgnored var unansweredVehicleProbes = 0
 
     public init(
         store: TelemetryStore? = nil,
@@ -191,6 +191,7 @@ public final class TelemetryEngine {
         monitor.reset()
         clearSessionMetadata()
         transportIdentity = transport.identity
+        unansweredVehicleProbes = 0 // each new connection starts at the short retry interval
         var attempt = 0
         while !Task.isCancelled {
             reachedStreaming = false
@@ -226,7 +227,9 @@ public final class TelemetryEngine {
     /// returned to the foreground, or the user tapped Retry).
     public func retryNow() {
         switch state {
-        case .reconnecting, .vehicleUnavailable, .failed, .disconnected: retryRequested = true
+        case .reconnecting, .vehicleUnavailable, .failed, .disconnected:
+            retryRequested = true
+            unansweredVehicleProbes = 0 // an explicit retry starts the short cadence again
         default: break
         }
     }

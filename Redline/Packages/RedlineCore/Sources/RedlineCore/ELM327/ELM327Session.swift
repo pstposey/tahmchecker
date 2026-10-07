@@ -99,6 +99,16 @@ public actor ELM327Session {
     private var timeoutTask: Task<Void, Never>?
 
     private var needsResync = false
+    /// A write failed part-way: part of a line may sit in the adapter's
+    /// buffer, so the next resync must probe even if every prompt arrived.
+    private var forceProbe = false
+    /// Lines written whose prompt has not been seen yet (late or lost).
+    private var unansweredWrites = 0
+    /// When the last line was written (resync spacing, see `confirmIdle`).
+    private var lastWriteAt: MonotonicInstant?
+    /// The adapter's own reply to `ATI` this session; a probe reply must
+    /// match it, so a late answer to another command can't pass as one.
+    private var probeReplyText: String?
 
     private let closeContinuation: AsyncStream<TransportError?>.Continuation
     /// Yields once when the underlying link closes, then finishes.
@@ -172,6 +182,7 @@ public actor ELM327Session {
             // anything else is written so it can't be completed by our next
             // command.
             needsResync = true
+            forceProbe = true
             let te = (error as? TransportError) ?? .writeFailed(String(describing: error))
             log.error("Write failed for \(wire): \(te)")
             throw ELMSessionError.transport(te)
@@ -188,6 +199,9 @@ public actor ELM327Session {
         }
 
         let response = ELMResponse(raw: completion.text, command: wire)
+        if wire == Self.resyncProbe, Self.isCleanProbeReply(response) {
+            probeReplyText = response.firstTextLine
+        }
         log.record(.rx, completion.text.trimmingCharacters(in: .whitespacesAndNewlines),
                    latency: completion.completedAt - sentAt)
         return ELMExchange(
@@ -208,6 +222,8 @@ public actor ELM327Session {
             throw ELMSessionError.commandRefused(command: wire, reason: "not transmittable")
         }
         try await transport.write(Data((wire + "\r").utf8))
+        unansweredWrites += 1
+        lastWriteAt = clock.now
     }
 
     public func close() async {
@@ -226,10 +242,11 @@ public actor ELM327Session {
                 pendingFirstByte = at
             }
             for text in framer.append(data) {
+                unansweredWrites = max(0, unansweredWrites - 1)
                 if pendingID != 0 {
                     complete(pendingID, .success(Completion(text: text, completedAt: at, firstByteAt: pendingFirstByte)))
                 } else if needsResync {
-                    needsResync = false
+                    // Resync still decides; other replies may be outstanding.
                     log.warning("Discarded late response: \(Self.oneLine(text))")
                 } else {
                     log.warning("Unsolicited data: \(Self.oneLine(text))")
@@ -328,23 +345,32 @@ public actor ELM327Session {
     // MARK: Resync
 
     private func resynchronize() async throws {
-        log.warning("Resynchronizing: waiting for late prompt")
-        if try await waitForPrompt(timing.latePromptGrace) {
+        log.warning("Resynchronizing: waiting for late prompts")
+        // Let every line already written produce its prompt. Each prompt
+        // (here or in `handle`) lowers `unansweredWrites`.
+        var wait = timing.latePromptGrace
+        while unansweredWrites > 0 {
+            if try await waitForPrompt(wait) {
+                wait = timing.latePromptGrace
+                continue
+            }
+            if Task.isCancelled { throw ELMSessionError.cancelled }
+            // Part of a late answer has arrived: the adapter is still
+            // printing, not stuck. Let it finish rather than interrupt it.
+            if framer.hasPartialResponse, wait != timing.resyncTimeout {
+                log.warning("Resynchronizing: late response in progress, waiting for it to finish")
+                wait = timing.resyncTimeout
+                continue
+            }
+            break
+        }
+        if unansweredWrites == 0, !forceProbe {
             needsResync = false
             return
         }
-        if Task.isCancelled { throw ELMSessionError.cancelled }
-        // Part of the late answer has arrived: the adapter is still printing,
-        // not stuck. Let it finish rather than interrupt it.
-        if framer.hasPartialResponse {
-            log.warning("Resynchronizing: late response in progress, waiting for it to finish")
-            if try await waitForPrompt(timing.resyncTimeout) {
-                needsResync = false
-                return
-            }
-            if Task.isCancelled { throw ELMSessionError.cancelled }
-        }
         try await confirmIdle()
+        unansweredWrites = 0
+        forceProbe = false
         needsResync = false
     }
 
@@ -353,44 +379,68 @@ public actor ELM327Session {
     /// line left in the adapter's buffer plus "ATI" is not hex either.
     static let resyncProbe = "ATI"
 
-    /// Sends the probe until the adapter answers it with plain text and then
-    /// stays quiet, which proves it is idle and in step with us.
+    /// Longest silence `confirmIdle` ever requires.
+    static let maxQuietWindow: Duration = .seconds(5)
+
+    /// Sends the probe until the adapter answers it with its identification
+    /// and then stays quiet, which proves it is idle and in step with us.
+    ///
+    /// A reply that arrives may still be a late answer to an earlier line, so:
+    /// - at most one probe is outstanding: replies that can't be this probe's
+    ///   are skipped while waiting for its own answer until its deadline;
+    /// - a probe reply must match the adapter's `ATI` text seen earlier;
+    /// - after it, the line must stay quiet for longer than the largest gap
+    ///   between this episode's writes, so the newest probe's own answer,
+    ///   if still to come, is caught instead of reaching the next command.
     private func confirmIdle() async throws {
+        var writes: [MonotonicInstant] = lastWriteAt.map { [$0] } ?? []
         for attempt in 1...max(1, timing.resyncProbeAttempts) {
             if Task.isCancelled { throw ELMSessionError.cancelled }
             if isClosed { throw ELMSessionError.closed }
             framer.reset()
-            let id = beginPending()
-            armTimeout(id, timing.resyncTimeout, command: Self.resyncProbe)
+            let deadline = clock.now + timing.resyncTimeout
+            var slot = beginPending()
+            armTimeout(slot, timing.resyncTimeout, command: Self.resyncProbe)
             log.record(.tx, Self.resyncProbe + " (resync probe \(attempt))")
             do {
                 try await transmit(Self.resyncProbe)
             } catch {
-                abandonPending(id)
+                abandonPending(slot)
                 if let e = error as? ELMSessionError { throw e }
                 throw ELMSessionError.transport((error as? TransportError) ?? .writeFailed(String(describing: error)))
             }
-            let reply: Completion
-            do {
-                reply = try await awaitCompletion(id)
-            } catch let error as ELMSessionError {
-                switch error {
-                case .transport, .cancelled, .closed: throw error
-                default:
-                    if isClosed { throw ELMSessionError.closed }
-                    log.warning("Resync probe \(attempt): no prompt")
-                    continue
+            if let at = lastWriteAt { writes.append(at) }
+
+            var answered = false
+            while true {
+                let reply: Completion
+                do {
+                    reply = try await awaitCompletion(slot)
+                } catch let error as ELMSessionError {
+                    switch error {
+                    case .transport, .cancelled, .closed: throw error
+                    default:
+                        if isClosed { throw ELMSessionError.closed }
+                        log.warning("Resync probe \(attempt): no answer")
+                    }
+                    break
                 }
+                let response = ELMResponse(raw: reply.text, command: Self.resyncProbe)
+                log.record(.rx, reply.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                if isProbeAnswer(response) {
+                    answered = true
+                    break
+                }
+                log.warning("Resync probe \(attempt): that reply isn't this probe's answer; still waiting for it")
+                let remaining = deadline - clock.now
+                guard remaining > .zero else { break }
+                slot = beginPending()
+                armTimeout(slot, remaining, command: Self.resyncProbe)
             }
-            let response = ELMResponse(raw: reply.text, command: Self.resyncProbe)
-            log.record(.rx, reply.text.trimmingCharacters(in: .whitespacesAndNewlines))
-            guard Self.isCleanProbeReply(response) else {
-                log.warning("Resync probe \(attempt): reply was not a clean identification (adapter still settling)")
-                continue
-            }
-            // Something still in flight would produce one more prompt; it
-            // must not complete the next command.
-            if try await waitForPrompt(timing.latePromptGrace) {
+            guard answered else { continue }
+
+            let quiet = timing.latePromptGrace + min(Self.largestGap(writes), Self.maxQuietWindow)
+            if try await waitForPrompt(quiet) {
                 log.warning("Resync probe \(attempt): another prompt followed; probing again")
                 continue
             }
@@ -400,6 +450,17 @@ public actor ELM327Session {
         }
         log.error("Adapter did not confirm it was idle after \(timing.resyncProbeAttempts) probes")
         throw ELMSessionError.adapterUnresponsive
+    }
+
+    private func isProbeAnswer(_ r: ELMResponse) -> Bool {
+        guard Self.isCleanProbeReply(r) else { return false }
+        guard let known = probeReplyText else { return true }
+        return r.firstTextLine == known
+    }
+
+    static func largestGap(_ instants: [MonotonicInstant]) -> Duration {
+        guard instants.count > 1 else { return .zero }
+        return zip(instants.dropFirst(), instants).map { $0 - $1 }.max() ?? .zero
     }
 
     /// Identification text only: no hex data, no "?", "STOPPED", "NO DATA"
