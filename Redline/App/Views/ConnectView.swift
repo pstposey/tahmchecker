@@ -101,7 +101,7 @@ struct ConnectView: View {
         } header: {
             Text("OBDLink MX+ (Made for iPhone)")
         } footer: {
-            Text("Pair once in iOS Settings › Bluetooth: plug the MX+ into the OBD port, press its Connect button (blue LED blinks fast), then tap “OBDLink MX+” within 2 minutes. iOS connects it automatically afterwards; it can take up to a minute to appear after plugging in. Only one app can use the adapter at a time, so close the OBDLink app and other OBD apps first.")
+            Text("Pair once in iOS Settings › Bluetooth: plug the MX+ into the OBD port, press its Connect button (blue LED blinks fast), then tap “OBDLink MX+” within 2 minutes. iOS connects it automatically afterwards; it can take up to a minute to appear after plugging in. Only one app can use the adapter at a time, so close the OBDLink app and other OBD apps first.\n\nConnected in Settings but not listed here? Redline may not know this adapter's protocol string yet: send the debug report (Debug tab).")
         }
     }
 

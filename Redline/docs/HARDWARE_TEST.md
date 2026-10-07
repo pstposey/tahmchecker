@@ -11,6 +11,20 @@ Nothing in Redline sends anything that can change the car (see SAFETY.md). The o
 3. **Quit the OBDLink app, WrenchTime and every other OBD app** (swipe them away). Only one app can use the adapter at a time.
 4. For the background tests (step 8), launch Redline **from the home screen**, not from Xcode. The debugger keeps apps awake in the background and hides the real behaviour.
 
+### Optional, at your desk: confirm the MX+'s protocol string first (Mac, ~5 min)
+
+Redline can only see the MX+ if it declares the adapter's MFi protocol string. OBDLink doesn't publish it; Redline declares two community-sourced guesses (`com.obdlink`, `com.scantool.stnobd`). OBDLink's own iOS app must declare the real one in its Info.plist, so checking it there removes the biggest risk of the first test. These are general ways to read an app's Info.plist, not something verified with the OBDLink app; skip this if neither is convenient.
+
+- **Mac with Apple silicon, if the OBDLink app installs from the Mac App Store** (iPhone apps sometimes do): install it, then in Terminal:
+  `plutil -p /Applications/OBDLink.app/Wrapper/*.app/Info.plist | grep -A4 UISupportedExternalAccessoryProtocols`
+- **Apple Configurator** (free, Mac App Store), with the OBDLink app installed on your iPhone and the iPhone connected:
+  1. Choose Add › Apps › OBDLink. Configurator downloads the app and then asks whether to replace the installed copy.
+  2. **Leave that dialog open.** The `.ipa` exists only while it's showing, under `~/Library/Group Containers/K36BKF7T3D.group.com.apple.configurator/Library/Caches/Assets/TemporaryItems/MobileApps/` (Finder › Go › Go to Folder).
+  3. Copy the `.ipa` out, then cancel the dialog.
+  4. Rename the copy to `.zip`, unzip it, and look in `Payload/*.app/Info.plist` for the same key.
+
+Send me the strings you find. If one isn't in Redline's list, it's a one-line change (`project.yml`) and a rebuild.
+
 ## OBDLink MX+
 
 ### Pair it (once)
@@ -25,7 +39,7 @@ Nothing in Redline sends anything that can change the car (see SAFETY.md). The o
 ### Connect and capture
 
 1. Redline › **Connect**. Under **OBDLink MX+ (Made for iPhone)**, the adapter should be listed with its manufacturer, model and firmware, and the status **"Ready — tap to connect"**. Write down exactly what you see.
-   - **Nothing listed** although Settings shows it as Connected: neither of Redline's two candidate protocol strings matches the MX+. Go to "If it doesn't work" below.
+   - **Nothing listed** although Settings shows it as Connected: neither of Redline's two candidate protocol strings matches the MX+. Still send the debug report (Debug tab): its **MFi accessories** section shows what iOS reports. Then see "If it doesn't work" below.
    - **"Waiting for iOS to finish authenticating…"**: wait 10 s and tap **Refresh**.
    - **"Not supported: offers …"**: send a screenshot. That line lists the MX+'s real protocol strings, which is exactly what's needed.
 2. Tap it. The status should go: Connecting → Initializing adapter → Contacting vehicle → Detecting supported data → **Connected**. The MX+'s BT LED should turn solid.
@@ -33,7 +47,7 @@ Nothing in Redline sends anything that can change the car (see SAFETY.md). The o
 4. **Debug** tab › **Prepare debug report** › **Copy**, and paste it into our chat. ← **the main result.** It contains:
    - transport type
    - accessory name, manufacturer, model, serial, firmware, hardware and advertised protocols
-   - the protocol string used
+   - the protocol string used, and an **MFi accessories** section: what Redline declares, every accessory iOS reports with its protocols, and the times the adapter connected and disconnected
    - each initialization command with its reply and timing
    - the connection-state history
    - round-trip times and the raw log
@@ -48,7 +62,7 @@ Nothing in Redline sends anything that can change the car (see SAFETY.md). The o
 
 ### If it doesn't work
 
-- **MX+ connected in Settings but not listed in Redline:** the protocol string is wrong. Redline can't see an accessory whose string it doesn't declare. Tell me; the fix is a one-line change in `project.yml` once the real string is known (OBDLink can supply it).
+- **MX+ connected in Settings but not listed in Redline:** the protocol string is wrong. Redline can't see an accessory whose string it doesn't declare. Send the debug report and tell me. The fix is a one-line change in `project.yml` once the real string is known: see "confirm the MX+'s protocol string" above, or ask OBDLink support (they offer app developers a contact).
 - **"iOS refused a session":** another app is holding the adapter. Quit it and tap Connect again.
 - **Status stuck at Connecting:** check Settings shows the MX+ as Connected and the BT LED is blinking slowly or solid.
 - **Initialization fails:** send the report anyway. The Initialization section shows which command failed and what the adapter said.

@@ -67,6 +67,9 @@ final class AppModel {
     func launch() {
         guard !launched else { return }
         launched = true
+        // Watch for MFi accessories from the start (after launch, as Apple
+        // advises), so connect/disconnect notifications are in the log.
+        prepareAccessories()
         switch settings.dataSource {
         case .simulation:
             startSimulation()
@@ -161,7 +164,7 @@ final class AppModel {
 
     private func ensureAccessoryCenter() -> ExternalAccessoryCenter {
         if let accessoryCenter { return accessoryCenter }
-        let center = ExternalAccessoryCenter(model: accessories)
+        let center = ExternalAccessoryCenter(model: accessories, log: engine.log)
         accessoryCenter = center
         return center
     }
@@ -198,6 +201,45 @@ final class AppModel {
         // it is plugged in; the engine keeps retrying after each timeout.
         engine.start(transport: AccessoryStreamTransport(identity: identity, connector: connector,
                                                          connectTimeout: .seconds(30), openTimeout: .seconds(5)))
+    }
+
+    // MARK: Debug report
+
+    /// App-level facts for the debug report: remembered adapter, what iOS
+    /// reports about MFi accessories, Bluetooth LE state. Nearby BLE device
+    /// names are included only when they look like OBD adapters (others may
+    /// be personal device names).
+    func debugAppendix() -> [DebugReportSection] {
+        accessoryCenter?.refresh()
+        let remembered: String
+        switch settings.rememberedAdapter {
+        case .bluetoothLE(let id, let name, let link)?:
+            remembered = "\(name) — Bluetooth LE [\(id.uuidString)]" + (link.map { " · verified link \($0.summary)" } ?? "")
+        case .externalAccessory(let a)?:
+            remembered = "\(a.name) — MFi accessory · \(a.manufacturer) \(a.modelNumber) · serial \(a.serialNumber)"
+        case nil:
+            remembered = "none"
+        }
+        let adapter = DebugReportSection(title: "Adapter settings", lines: [
+            "Remembered adapter: \(remembered)",
+            "Connect automatically at launch: \(settings.autoConnect ? "on" : "off")",
+            "Data source: \(settings.dataSource.title)",
+        ])
+        let declared = accessories.declaredProtocols.isEmpty ? ExternalAccessoryCenter.declaredProtocols : accessories.declaredProtocols
+        let mfi = DebugReportSection(
+            title: "MFi accessories (External Accessory)",
+            lines: AccessoryDiagnostics.reportLines(monitoring: accessories.isMonitoring, declared: declared,
+                                                    connected: accessories.connected, events: accessories.events))
+        var ble = [
+            "Status: \(bluetooth.availability.title)",
+            "Scanning: \(bluetooth.isScanning ? "yes" : "no")",
+            "Devices seen in scans: \(bluetooth.discovered.count)",
+        ]
+        for d in bluetooth.discovered.filter(\.looksLikeOBDAdapter).sorted(by: { $0.rssi > $1.rssi }) {
+            ble.append("  \(d.displayName)  \(d.rssi) dBm  [\(d.id.uuidString)]"
+                       + (d.advertisedServices.isEmpty ? "" : "  advertises \(d.advertisedServices.joined(separator: ", "))"))
+        }
+        return [adapter, mfi, DebugReportSection(title: "Bluetooth LE", lines: ble)]
     }
 
     // MARK: App lifecycle

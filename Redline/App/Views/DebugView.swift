@@ -22,7 +22,7 @@ struct DebugView: View {
                     // Generated on demand: the report includes the raw log and
                     // must not be rebuilt on every telemetry update.
                     Button("Prepare debug report") {
-                        report = engine.debugReport(appVersion: model.appVersion)
+                        report = engine.debugReport(appVersion: model.appVersion, appendix: model.debugAppendix())
                         copied = false
                     }
                     if let report {
@@ -84,6 +84,32 @@ struct DebugView: View {
                             Text(item.value).font(.caption.monospaced()).multilineTextAlignment(.trailing)
                         }
                     }
+                }
+
+                Section {
+                    LabeledContent("Redline declares") {
+                        Text(model.accessories.declaredProtocols.joined(separator: "\n"))
+                            .font(.caption.monospaced())
+                            .multilineTextAlignment(.trailing)
+                    }
+                    if model.accessories.connected.isEmpty {
+                        Text(model.accessories.isMonitoring ? "iOS reports no connected MFi accessory" : "Not monitoring yet")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.accessories.connected) { a in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(a.displayName)
+                            Text("\(a.manufacturer) \(a.modelNumber) · fw \(a.firmwareRevision)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text("Protocols: " + (a.protocolStrings.isEmpty ? "(none yet)" : a.protocolStrings.joined(separator: ", ")))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(model.accessories.supportedProtocol(of: a) != nil ? Theme.ok : Theme.caution)
+                        }
+                    }
+                    Button("Refresh") { model.refreshAccessories() }
+                } header: {
+                    Text("MFi accessories (OBDLink MX+)")
                 }
 
                 Section("Adapter / vehicle") {

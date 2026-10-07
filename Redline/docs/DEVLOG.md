@@ -89,3 +89,14 @@ The owner switched the primary adapter to an OBDLink MX+ (the Vgate stays suppor
 **CI lesson:** a race in the end-to-end capture test (a poll from the previous preset still in flight) failed on the macOS runner only. It is fixed, and the suite was re-run 3× with all CPUs saturated.
 
 **Tests:** 144, on Linux and macOS. The iOS app builds with `xcodebuild` (generic iOS device, unsigned) with no Swift warnings. Mocks are not hardware: everything MX+-specific listed in MXPLUS.md and HARDWARE_TEST.md still needs the physical adapter.
+
+## 2026-10-07: First-test readiness
+
+- More searching found no further sourced MX+ protocol strings beyond `com.obdlink` and `com.scantool.stnobd`. No unsourced guesses were added.
+- The biggest first-test risk is that both strings are wrong, which makes the MX+ invisible to Redline. So the test was made diagnosable whatever happens:
+  - Accessory monitoring starts at launch, and every connect/disconnect notification is logged with the accessory's metadata and protocols.
+  - The debug report gains three sections: Adapter settings, MFi accessories (declared vs reported protocols, status per accessory, recent events) and Bluetooth LE. Nearby BLE names appear only if they look like OBD adapters, since others may be personal device names.
+  - The Debug tab shows the MFi accessory list live.
+  - The Connect screen explains what to do when the MX+ is connected in Settings but not listed.
+- HARDWARE_TEST.md gains an optional pre-test step: read the real protocol string from OBDLink's own app's Info.plist on a Mac. These are general methods, not verified with that app.
+- Tests: 147.

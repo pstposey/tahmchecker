@@ -257,3 +257,44 @@ struct AdapterProtocolSettingTests {
         #expect(info.storedProtocolBeforeInit == "?")
     }
 }
+
+@Suite("Adapters: MFi diagnostics in the debug report")
+struct AccessoryDiagnosticsTests {
+    static let declared = ["com.obdlink", "com.scantool.stnobd"]
+
+    @Test func explainsAnEmptyListAsAProtocolStringMismatch() {
+        let lines = AccessoryDiagnostics.reportLines(monitoring: true, declared: Self.declared, connected: [], events: [])
+        #expect(lines.first == "Redline declares: com.obdlink, com.scantool.stnobd")
+        #expect(lines.contains("Connected accessories reported by iOS: none"))
+        #expect(lines.contains { $0.contains("protocol string is not one of the above") })
+    }
+
+    @Test func listsEveryAccessoryWithItsStatusAndProtocols() {
+        let ok = AccessorySelectionTests.accessory(1, name: "Mock A", protocols: ["com.obdlink"])
+        let other = AccessorySelectionTests.accessory(2, name: "Mock B", protocols: ["com.example.audio"])
+        let pending = AccessorySelectionTests.accessory(3, name: "Mock C", protocols: [])
+        let events = [AccessoryEvent(at: Date(), kind: .connected, accessory: ok),
+                      AccessoryEvent(at: Date(), kind: .disconnected, accessory: nil)]
+        let text = AccessoryDiagnostics.reportLines(monitoring: true, declared: Self.declared,
+                                                    connected: [ok, other, pending], events: events).joined(separator: "\n")
+        #expect(text.contains("- Mock A: SUPPORTED via com.obdlink"))
+        #expect(text.contains("- Mock B: NOT SUPPORTED"))
+        #expect(text.contains("Advertised protocols: com.example.audio"))
+        #expect(text.contains("- Mock C: not ready"))
+        #expect(text.contains("connected  Mock A [com.obdlink]"))
+        #expect(text.contains("disconnected  (unknown accessory)"))
+    }
+
+    @MainActor
+    @Test func appendixSectionsAppearBeforeTheRawLog() {
+        let engine = TelemetryEngine()
+        let report = engine.debugReport(appVersion: "t", appendix: [
+            DebugReportSection(title: "MFi accessories (External Accessory)", lines: ["Redline declares: com.obdlink"]),
+            DebugReportSection(title: "Bluetooth LE", lines: []),
+        ])
+        let mfi = report.range(of: "== MFi accessories (External Accessory) ==")
+        let raw = report.range(of: "== Raw log")
+        #expect(mfi != nil && raw != nil && mfi!.lowerBound < raw!.lowerBound)
+        #expect(report.contains("== Bluetooth LE ==\n(none)"))
+    }
+}

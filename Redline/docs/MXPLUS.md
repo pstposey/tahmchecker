@@ -56,7 +56,11 @@ Neither OBDLink nor Apple publishes the MX+'s External Accessory protocol string
 What happens on the first test:
 
 - **One of the strings is correct:** the MX+ appears in Redline's Connect list. Its full metadata and every protocol it advertises go into the debug report.
-- **Neither is correct:** the MX+ won't appear in Redline at all, even though iOS Settings shows it as connected. The fix is to learn the real string (from OBDLink, which offers app developers a listing/whitelisting contact) and add it to `project.yml`. Redline cannot read an undeclared accessory's protocol list.
+- **Neither is correct:** the MX+ won't appear in Redline at all, even though iOS Settings shows it as connected. Redline cannot read an undeclared accessory's protocol list. The fix is to learn the real string and add it to `project.yml`. Two ways to learn it:
+  - OBDLink's own iOS app must declare it in its Info.plist; HARDWARE_TEST.md describes how to read that from a Mac.
+  - OBDLink offers app developers a listing/whitelisting contact.
+
+The debug report's **MFi accessories** section always shows what Redline declares, every accessory iOS reports (with its protocols and whether it's supported), and recent connect/disconnect notifications. Redline starts watching for accessories at launch, so these events are also in the raw log.
 
 ## How Redline talks to it
 

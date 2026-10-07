@@ -153,3 +153,67 @@ public enum AccessorySelector {
         return match.map { .success($0) } ?? .failure(.targetNotConnected)
     }
 }
+
+/// An accessory connect/disconnect notification, kept for the debug report
+/// (when the MX+ appeared, disappeared, and what it said about itself).
+public struct AccessoryEvent: Sendable, Equatable {
+    public enum Kind: String, Sendable {
+        case connected
+        case disconnected
+    }
+
+    public let at: Date
+    public let kind: Kind
+    public let accessory: AccessoryDescriptor?
+
+    public init(at: Date, kind: Kind, accessory: AccessoryDescriptor?) {
+        self.at = at
+        self.kind = kind
+        self.accessory = accessory
+    }
+}
+
+/// The "MFi accessories" section of the debug report: what Redline declares,
+/// everything iOS reports as connected (supported or not), and recent
+/// connect/disconnect notifications. This is what tells whether the MX+'s
+/// protocol string matches one Redline declares.
+public enum AccessoryDiagnostics {
+    public static let maxEvents = 20
+
+    public static func reportLines(monitoring: Bool, declared: [String], connected: [AccessoryDescriptor],
+                                   events: [AccessoryEvent]) -> [String] {
+        guard monitoring else {
+            return ["Not started (opens with the Connect tab or an MFi connection)",
+                    "Redline declares: \(declared.isEmpty ? "(none)" : declared.joined(separator: ", "))"]
+        }
+        var lines = ["Redline declares: \(declared.isEmpty ? "(none)" : declared.joined(separator: ", "))"]
+        if connected.isEmpty {
+            lines.append("Connected accessories reported by iOS: none")
+            lines.append("  (iOS lists only accessories whose protocol Redline declares; an MX+ shown as Connected in "
+                         + "Settings but missing here means its protocol string is not one of the above)")
+        } else {
+            lines.append("Connected accessories reported by iOS: \(connected.count)")
+            for a in connected {
+                let status: String
+                if let p = AccessorySelector.supportedProtocol(of: a, declared: declared) {
+                    status = "SUPPORTED via \(p)"
+                } else if a.protocolStrings.isEmpty {
+                    status = "not ready (no protocols yet: iOS still authenticating)"
+                } else {
+                    status = "NOT SUPPORTED (no declared protocol)"
+                }
+                lines.append("- \(a.displayName): \(status)")
+                for item in a.detailItems { lines.append("    \(item.key): \(item.value)") }
+            }
+        }
+        let clockTime = DateFormatter()
+        clockTime.locale = Locale(identifier: "en_US_POSIX")
+        clockTime.dateFormat = "HH:mm:ss.SSS"
+        lines.append("Recent accessory notifications: \(events.isEmpty ? "none" : String(events.count))")
+        for e in events.suffix(maxEvents) {
+            let who = e.accessory.map { "\($0.displayName) [\($0.protocolStrings.joined(separator: ", "))]" } ?? "(unknown accessory)"
+            lines.append("  \(clockTime.string(from: e.at))  \(e.kind.rawValue)  \(who)")
+        }
+        return lines
+    }
+}

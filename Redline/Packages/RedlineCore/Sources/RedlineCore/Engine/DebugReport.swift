@@ -1,11 +1,23 @@
 import Foundation
 
+/// A block of app-level facts appended to the debug report (e.g. which MFi
+/// accessories iOS reports, Bluetooth LE state), placed before the raw log.
+public struct DebugReportSection: Sendable, Equatable {
+    public var title: String
+    public var lines: [String]
+
+    public init(title: String, lines: [String]) {
+        self.title = title
+        self.lines = lines
+    }
+}
+
 extension TelemetryEngine {
     /// Plain-text snapshot of everything needed to diagnose a hardware
     /// session: link, adapter, protocol, supported PIDs, polling rates,
     /// latency, and the raw command log. Designed to be pasted into an issue
     /// or chat. Contains no location or personal data; VIN is not read.
-    public func debugReport(appVersion: String, logLines: Int = 400) -> String {
+    public func debugReport(appVersion: String, logLines: Int = 400, appendix: [DebugReportSection] = []) -> String {
         var out: [String] = []
         let now = ContinuousClock().now
         out.append("REDLINE DEBUG REPORT")
@@ -99,6 +111,12 @@ extension TelemetryEngine {
         for c in p.perCommand {
             out.append("  \(c.command)  \(String(format: "%.1f", c.rateHz)) Hz  ok \(c.successesInWindow)  "
                        + "fail \(c.failuresInWindow)  median \(ms(c.medianRoundTripMs))")
+        }
+
+        for section in appendix {
+            out.append("")
+            out.append("== \(section.title) ==")
+            out.append(contentsOf: section.lines.isEmpty ? ["(none)"] : section.lines)
         }
 
         out.append("")

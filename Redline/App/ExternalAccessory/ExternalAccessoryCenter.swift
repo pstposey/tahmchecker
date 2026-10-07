@@ -11,6 +11,10 @@ final class AccessoryModel {
     var connected: [AccessoryDescriptor] = []
     /// `UISupportedExternalAccessoryProtocols` from Info.plist.
     var declaredProtocols: [String] = []
+    /// Accessory notifications are being received (debug report).
+    var isMonitoring = false
+    /// Recent connect/disconnect notifications, newest last (debug report).
+    var events: [AccessoryEvent] = []
 
     func supportedProtocol(of accessory: AccessoryDescriptor) -> String? {
         AccessorySelector.supportedProtocol(of: accessory, declared: declaredProtocols)
@@ -31,6 +35,7 @@ final class AccessoryModel {
 @MainActor
 final class ExternalAccessoryCenter {
     let model: AccessoryModel
+    private let log: CommLog
     private var observers: [NSObjectProtocol] = []
     private var changeWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var liveSessions: [WeakSession] = []
@@ -43,20 +48,45 @@ final class ExternalAccessoryCenter {
         Bundle.main.object(forInfoDictionaryKey: "UISupportedExternalAccessoryProtocols") as? [String] ?? []
     }
 
-    init(model: AccessoryModel) {
+    init(model: AccessoryModel, log: CommLog) {
         self.model = model
+        self.log = log
         model.declaredProtocols = Self.declaredProtocols
         // Once for the app's lifetime; the notifications are not sent otherwise.
         EAAccessoryManager.shared().registerForLocalNotifications()
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .EAAccessoryDidConnect, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.accessoriesChanged(disconnected: nil) }
+        observers.append(center.addObserver(forName: .EAAccessoryDidConnect, object: nil, queue: .main) { [weak self] note in
+            let accessory = (note.userInfo?[EAAccessoryKey] as? EAAccessory).map(Self.describe)
+            MainActor.assumeIsolated {
+                self?.record(.connected, accessory)
+                self?.accessoriesChanged(disconnected: nil)
+            }
         })
         observers.append(center.addObserver(forName: .EAAccessoryDidDisconnect, object: nil, queue: .main) { [weak self] note in
-            let id = (note.userInfo?[EAAccessoryKey] as? EAAccessory)?.connectionID
-            MainActor.assumeIsolated { self?.accessoriesChanged(disconnected: id) }
+            let accessory = (note.userInfo?[EAAccessoryKey] as? EAAccessory).map(Self.describe)
+            MainActor.assumeIsolated {
+                self?.record(.disconnected, accessory)
+                self?.accessoriesChanged(disconnected: accessory?.connectionID)
+            }
         })
+        model.isMonitoring = true
         refresh()
+        log.info("MFi: monitoring accessories; Redline declares [\(model.declaredProtocols.joined(separator: ", "))]; "
+                 + "iOS reports \(model.connected.count) connected")
+        for a in model.connected { log.info("MFi: already connected — \(Self.summary(a))") }
+    }
+
+    private func record(_ kind: AccessoryEvent.Kind, _ accessory: AccessoryDescriptor?) {
+        model.events.append(AccessoryEvent(at: Date(), kind: kind, accessory: accessory))
+        if model.events.count > AccessoryDiagnostics.maxEvents {
+            model.events.removeFirst(model.events.count - AccessoryDiagnostics.maxEvents)
+        }
+        log.info("MFi: accessory \(kind.rawValue) — \(accessory.map(Self.summary) ?? "unknown accessory")")
+    }
+
+    nonisolated static func summary(_ a: AccessoryDescriptor) -> String {
+        "\(a.displayName) · \(a.manufacturer) \(a.modelNumber) · fw \(a.firmwareRevision) · hw \(a.hardwareRevision) · "
+            + "protocols [\(a.protocolStrings.joined(separator: ", "))] · id \(a.connectionID)"
     }
 
     /// Re-reads the connected list (also used on returning to the
