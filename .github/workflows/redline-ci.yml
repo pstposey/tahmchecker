@@ -52,3 +52,75 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             | tee build/xcodebuild.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
           grep -q "BUILD SUCCEEDED" build/xcodebuild.log
+
+  # The owner builds with Xcode 27 (Apple silicon) or Xcode 26 (Intel), so
+  # build with the newest installed Xcode of each, then launch the app on a
+  # fresh iOS Simulator and walk the first-boot path without an adapter
+  # (UITests/FirstLaunchUITests.swift). Screenshots, the app's log and any
+  # crash reports are uploaded as an artifact.
+  first-launch:
+    name: Xcode ${{ matrix.xcode }} — iOS build + first-launch test (Simulator)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        xcode: ["26", "27"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode ${{ matrix.xcode }}
+        id: xcode
+        run: Redline/ci/select-xcode.sh ${{ matrix.xcode }}
+      - name: Build Redline for iOS devices (unsigned)
+        if: steps.xcode.outputs.found == 'true'
+        working-directory: Redline
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project Redline.xcodeproj \
+            -scheme Redline \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DeviceDerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tee build/device-build.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build/device-build.log
+      - name: Create a fresh simulator
+        if: steps.xcode.outputs.found == 'true'
+        id: sim
+        run: echo "udid=$(Redline/ci/make-simulator.sh ${{ matrix.xcode }})" >> "$GITHUB_OUTPUT"
+      - name: First-launch UI test
+        if: steps.xcode.outputs.found == 'true'
+        working-directory: Redline
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Redline.xcodeproj \
+            -scheme Redline \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath build/SimDerivedData \
+            -resultBundlePath build/FirstLaunch.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee build/ui-test.log | grep -E "error:|warning:|Test Case|\*\* TEST" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" build/ui-test.log
+      - name: Collect screenshots, app log and crash reports
+        if: always() && steps.xcode.outputs.found == 'true'
+        working-directory: Redline
+        run: |
+          mkdir -p build/first-launch
+          xcrun xcresulttool export attachments --path build/FirstLaunch.xcresult --output-path build/first-launch || true
+          if [ -n "${{ steps.sim.outputs.udid }}" ]; then
+            xcrun simctl spawn "${{ steps.sim.outputs.udid }}" log show --last 30m --style compact \
+              --predicate 'process == "Redline"' > build/first-launch/app.log 2>&1 || true
+            echo "Runtime issues in the app log (main-thread checker, SwiftUI, faults):"
+            grep -iE "main thread checker|publishing changes from|modifying state during view update|fault|crash" build/first-launch/app.log | head -50 || true
+          fi
+          cp ~/Library/Logs/DiagnosticReports/Redline* build/first-launch/ 2>/dev/null || true
+          ls -la build/first-launch
+      - name: Upload first-launch artifacts
+        if: always() && steps.xcode.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: first-launch-xcode-${{ matrix.xcode }}
+          path: Redline/build/first-launch
+          if-no-files-found: warn

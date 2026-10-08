@@ -70,12 +70,32 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+  # First-launch smoke test, run by CI on the iOS Simulator. Built only by
+  # the scheme's Test action, so Run and installing to a phone never touch it.
+  RedlineUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Redline
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pstposey.RedlineUITests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        TEST_TARGET_NAME: Redline
 schemes:
   Redline:
     build:
       targets:
         Redline: all
+        RedlineUITests: [test]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - RedlineUITests
     archive:
       config: Release
